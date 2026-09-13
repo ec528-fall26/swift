@@ -1,12 +1,15 @@
 # EC528 Project — Highly Available Object Storage Development
 
-**Team:** <names>
-**Mentor:** Andressa Cabistani (Red Hat)
-**Project:** <one sentence: what this system does>
+**Team:** Abdoul Abdou, Bowen Tan, Gyoungmin Chae, Yihan Wang, Jiabao Chen   
+**Mentor:** Andressa Cabistani (Red Hat)  
+**Project:** OpenStack Swift — contributing a tested bug fix to a real distributed object store, to learn how it handles replication and durability.
 
 ## What this is
 
-<2-3 sentences. The problem, and what your system does about it.>
+Swift is a highly available, distributed, eventually consistent object store that keeps data
+durable across node failures by replicating objects and rebalancing them when the cluster changes.
+We contribute to that durability path directly: pick a live bug from Swift's tracker, reproduce it
+on a dev cluster, fix it with a failing-then-passing test, and push it through Gerrit review and CI.
 
 ## Quick start
 
