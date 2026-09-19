@@ -6,7 +6,7 @@ progress is graded against for the rest of the semester — see the
 
 ## 1. Problem
 
-For every file, their placement decision a Swift cluster makes comes from a single
+For every file, their placement in a Swift cluster makes comes from a single
 **ring builder file**, which are generated from the builder, but the relationship is
 one-way: the builder is the artifact an operator edits, rebalances and keeps,
 and the generated rings are output. In practice the builder file is the
@@ -19,6 +19,12 @@ partway through, the file is left half-written and can no longer be read back.
 The same is true even with no crash at all: anything that reads the builder
 while it is being written will read the half-way modified file.
 
+The reporter's own follow-up on this entry notes that the same pattern appears
+in more than one place. **Composite ring builder file**, which records how
+several individual rings are joined into one larger ring. It is written in
+exactly the same way — serialized over the existing file, in place — and read
+the same way, so a crash during a composite ring update leaves it unreadable as well.
+
 ## 2. Proposed design
 
 We will change how the ring builder file is written so that the cluster's source
@@ -29,13 +35,23 @@ A reader, or the next invocation of the tool after
 a crash, therefore sees either the complete previous builder or the complete new
 one, and never something in between.
 
-Two decisions shape the change. First, the scratch file must live in the same
-directory as the target. The swap is only atomic within one filesystem, and
-builder files often sit on a dedicated ring volume, so writing the scratch copy
-to a general temporary directory would quietly lose exactly the property we are
-trying to gain. Second, we accept the cost of both durability steps rather than
-the cheaper single step, because the failure we are protecting against includes
-the machine losing power, not just the process being killed.
+For the directory follow up, we will use the same approach for composite ring builder files. The
+existing composite ring builder file is never modified in place, and a new
+composite ring builder temp file is written and flushed to storage before it is swapped in.
+
+### Before and after
+
+**Before.** The builder is serialized directly over the existing file, so a crash
+partway through — or any reader running at the same time — can observe a
+half-written builder:
+
+<img src="Pictures/Design_proposal_before_drawio.png" width="600" alt="Before: the ring builder file is rewritten in place">
+
+**After.** The new builder is written to a separate temp file and flushed to
+storage, then swapped in, so a reader sees either the complete previous builder
+or the complete new one:
+
+![After: the new ring builder is written to a temp file and flushed before it replaces the existing file](Pictures/Design_proposal_after_drawio.png)
 
 ## 3. What makes this hard
 
