@@ -73,11 +73,11 @@ without asking you, whether it is done. "Improve performance" is not verifiable;
 
 | Demo | Date | Milestone | How we will demonstrate it |
 | --- | --- | --- | --- |
-| Demo 2 | 10/21 | | |
-| Demo 2 | 10/21 | | |
-| Demo 3 | 11/16 | | |
-| Demo 3 | 11/16 | | |
-| Final | 12/09 | | |
+| Demo 2 | 10/21 | Bug reproduction | On a local Swift environment, kill the ring builder mid-update, then run a ring position lookup; it fails with `does not contain valid composite ring data`.|
+| Demo 2 | 10/21 | Bug fix | Run the same kill-mid-update against the patched builder; the composite ring builder is byte-identical to its pre-crash contents and ring position lookups still succeed. |
+| Demo 3 | 11/16 | Deployment | The Launchpad bug report for the composite ring builder is marked Fix Released with no unanswered questions or remaining issues. If swift official's review on the patch is delayed, community's confirmation of fixing of the bug can be used as demostration. |
+| Demo 3 | 11/16 | Comparison poster | Completion of `slides/poster.pdf` comparing swift's consistant hashing ring and RDBMS's(postgreSQL's) share nothing technology on scalability and fault tolerance. |
+| Final | 12/09 | Project summary | Final demo delivered with the recorded video presentation, completed `docs/design-document.md` and `slides/final_demo.pptx` |
 
 *You may revise these later — real projects change direction. Announce the change
 and its justification at the demo and you are graded against the revised plan.
