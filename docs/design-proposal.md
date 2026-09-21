@@ -55,9 +55,49 @@ or the complete new one:
 
 ## 3. What makes this hard
 
-The single most technically difficult part of this project, and why it is not
-solved by wiring existing services together. *(This is what the `challenge`
-criterion is graded on.)*
+At first the fix sounds easy: write the new builder to a temp file and rename
+it over the old one. As we studied it, we found the hard part is making sure the
+replacement is safe no matter when the process dies. The builder file is the cluster's source of truth, so a mistake here corrupts the cluster's layout and not only one file.
+
+Writing a temp file and renaming it is only safe if a few steps happen in the
+right order:
+
+1. **Write the full new builder to the temp file.** If the tool crashes here,
+   the old builder has not been touched, and the half-written temp file is
+   simply ignored.
+2. **Flush the temp file to storage.** Without this, the operating
+   system may still be holding the data in memory. After a power loss the
+   rename could survive while the contents do not, leaving an empty or
+   partial file under the real builder name. That is the same bug we are
+   trying to fix.
+3. **Rename the temp file over the old builder.** On Linux, a rename within one
+   filesystem is atomic, so a reader sees the old file or the new file and
+   never a mix. This only holds if the temp file is in the *same directory*
+   as the builder. A temp file may be on a different filesystem,
+   where the rename becomes a copy and is no longer atomic.
+4. **Flush the directory as well.** The rename is itself a change to the
+   directory, and it can be lost in a crash if the directory is not flushed.
+
+If any step is skipped or done out of order, we get a new way to fail instead of
+fixing the old one. That is why this is hard: there is a possible crash between
+every pair of steps, and for each one we have to be able to say what the next
+reader or tool run will see.
+
+There are also some side problems around the same fix that we still need to
+understand:
+
+- **Leftover temp files.** A crash can leave a stale temp file behind. The tool
+  must not mistake it for a valid builder, and must not fail because one
+  already exists.
+- **Two runs at once.** If two calls use the same temp file name they can
+  overwrite each other's work, so the name or a lock has to prevent that.
+
+This is not solved by wiring existing services together, because there is no
+library call that makes a Swift builder update crash-safe. We have to read
+Swift's own code to find every place the builder and composite builder are
+written in place, and change them without breaking the rest of the tool. We
+also have to prove the result. The crash window is tiny, so we cannot just
+hope to hit it by chance. 
 
 ## 4. How you will know it worked
 
