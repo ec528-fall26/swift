@@ -101,8 +101,9 @@ hope to hit it by chance.
 
 ## 4. How you will know it worked
 
-The measurements that will show your system does what you claim: what you will
-measure, against what baseline, and what result would count as success.
+We will first reproduce the builder file corruption issue on the original Swift implementation by interrupting the `RingBuilder` save process, and use this behavior as our baseline. We will then perform the same failure tests on our modified atomic-save implementation. Our primary success criterion is that, after an interrupted save, the last valid builder file remains unchanged from its pre-failure state, can still be loaded successfully, and continues to support ring position lookups.
+
+We will also simulate failures at different stages of the save process, including serialization, flushing, `fsync`, and file replacement, to verify that the builder remains protected across different failure points. In addition, we will check that temporary files created during failed save operations are handled correctly. Finally, we will run Swift's existing test suite together with our new atomic-save tests to ensure that the modification does not introduce any regressions to existing functionality.
 
 ## 5. Milestones
 
