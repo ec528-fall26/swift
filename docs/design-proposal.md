@@ -39,6 +39,13 @@ For the directory follow up, we will use the same approach for composite ring bu
 existing composite ring builder file is never modified in place, and a new
 composite ring builder temp file is written and flushed to storage before it is swapped in.
 
+Alongside the code, we will design a comparison poster (`slides/poster.pdf`,
+delivered with Demo 3) that places the fix in context by contrasting Swift's
+consistent hashing ring with a shared-nothing RDBMS such as PostgreSQL, which
+not only secures our understanding of Swift's design, but also 
+provides a broader perspective on the tradeoffs between different approaches to 
+scalability and fault tolerance.
+
 ### Before and after
 
 **Before.** The builder is serialized directly over the existing file, so a crash
@@ -57,7 +64,8 @@ or the complete new one:
 
 At first the fix sounds easy: write the new builder to a temp file and rename
 it over the old one. As we studied it, we found the hard part is making sure the
-replacement is safe no matter when the process dies. The builder file is the cluster's source of truth, so a mistake here corrupts the cluster's layout and not only one file.
+replacement is safe no matter when the process dies. The builder file is the cluster's source of truth,
+so a mistake here corrupts the cluster's layout and not only one file.
 
 Writing a temp file and renaming it is only safe if a few steps happen in the
 right order:
@@ -117,7 +125,7 @@ without asking you, whether it is done. "Improve performance" is not verifiable;
 | Demo 2 | 10/21 | Bug reproduction | On a local Swift environment, kill the ring builder mid-update, then run a ring position lookup; it fails with `does not contain valid composite ring data`.|
 | Demo 2 | 10/21 | Bug fix | Run the same kill-mid-update against the patched builder; the composite ring builder is byte-identical to its pre-crash contents and ring position lookups still succeed. |
 | Demo 3 | 11/16 | Deployment | The Launchpad bug report for the composite ring builder is marked Fix Released with no unanswered questions or remaining issues. If swift official's review on the patch is delayed, community's confirmation of fixing of the bug can be used as demostration. |
-| Demo 3 | 11/16 | Comparison poster | Completion of `slides/poster.pdf` comparing swift's consistant hashing ring and RDBMS's(postgreSQL's) share nothing technology on scalability and fault tolerance. |
+| Demo 3 | 11/16 | Comparison poster | Mentor's PR approval of `slides/poster.pdf` comparing swift's consistant hashing ring and RDBMS's(postgreSQL's) share nothing technology on scalability and fault tolerance. |
 | Final | 12/09 | Project summary | Final demo delivered with the recorded video presentation, completed `docs/design-document.md` and `slides/final_demo.pptx` |
 
 *You may revise these later — real projects change direction. Announce the change
@@ -126,6 +134,32 @@ Silently dropping a milestone counts as a miss.*
 
 ## 6. Risks
 
-1. If we going to implement the atomic saving, it might be more complicated than just simply writing the builder data into a temporary file and rename it. This failre could probably occur at any point during the serialization, flushing, synchronization or file replacement. If these operations are not handled correctly, the builder file may still become inconsistent after a crash. To address this risk, we will follow existing file-writing patterns in Swift where possible and ensure that the temporary file is fully written and synchronized before replacing the original builder file. We will also simulate failures at different stages of the save process and verify that the last valid builder file remains readable.
-2. A failed save operation may leave incomplete temporary files behind. For example, if serialization fails after a temporary file has already been created, the original builder may remain safe, but an incomplete temporary file could remain on disk. Repeated failures could therefore create unnecessary files or interfere with later save operations. To mitigate this risk, the implementation will clean up temporary files when a save fails while preserving the original builder file. We will test these failure cases explicitly to verify that unsuccessful saves do not leave invalid persistent state.
-3. Changing RingBuilder.save() could introduce regressions into existing Swift functionality. The current implementation is already used by Swift's ring-management tools, so the atomic-save modification must improve failure safety without changing normal RingBuilder behavior or making existing builder files incompatible. To reduce this risk, we will preserve the existing RingBuilder.save() interface and serialization format. We will run both the existing Swift unit tests and new tests for atomic-save behavior, comparing the results against the unmodified Swift baseline to verify that the new implementation provides stronger failure safety without breaking existing functionality.
+1. If we're going to implement the atomic saving, it might be more complicated
+   than just simply writing the builder data into a temporary file and rename
+   it. This failure could probably occur at any point during the serialization,
+   flushing, synchronization or file replacement. If these operations are not
+   handled correctly, the builder file may still become inconsistent after a
+   crash. To address this risk, we will follow existing file-writing patterns in
+   Swift where possible and ensure that the temporary file is fully written and
+   synchronized before replacing the original builder file. We will also
+   simulate failures at different stages of the save process and verify that the
+   last valid builder file remains readable.
+2. A failed save operation may leave incomplete temporary files behind. For
+   example, if serialization fails after a temporary file has already been
+   created, the original builder may remain safe, but an incomplete temporary
+   file could remain on disk. Repeated failures could therefore create
+   unnecessary files or interfere with later save operations. To mitigate this
+   risk, the implementation will clean up temporary files when a save fails
+   while preserving the original builder file. We will test these failure cases
+   explicitly to verify that unsuccessful saves do not leave invalid persistent
+   state.
+3. Changing `RingBuilder.save()` could introduce regressions into existing Swift
+   functionality. The current implementation is already used by Swift's
+   ring-management tools, so the atomic-save modification must improve failure
+   safety without changing normal `RingBuilder` behavior or making existing
+   builder files incompatible. To reduce this risk, we will preserve the
+   existing `RingBuilder.save()` interface and serialization format. We will run
+   both the existing Swift unit tests and new tests for atomic-save behavior,
+   comparing the results against the unmodified Swift baseline to verify that
+   the new implementation provides stronger failure safety without breaking
+   existing functionality.
