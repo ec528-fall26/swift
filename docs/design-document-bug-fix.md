@@ -14,7 +14,7 @@ Include the things that did not work.
 
 ## 3. Setup
 
-### Provisioning: `experiments/setup.sh`
+### Provisioning: `../experiments/bug_fix/setup.sh`
 
 The whole environment is built by one script. On a clean Ubuntu 24.04 machine:
 
@@ -79,6 +79,14 @@ python experiments/exp0_unittests.py \
 echo "exit=$?"
 ```
  
+
+On the unpatched tree, the first run of these experiments reports exactly **one**
+failing test — `TestRingBuilder.test_save_partial_dump_does_nothing`, the
+reproduction we added in this branch, which pins the bug in
+`RingBuilder.save()`. That single failure *is* the bug, so it is expected, not an
+accident. After the atomic-save fix is applied, re-run the same commands: that
+test passes and the suite reports zero failures, so **all tests pass** and any
+remaining failure would be a regression from our change.
 
 ### Experiment 1: `RingBuilder.save()` is not atomic (the bug we fix)
 
