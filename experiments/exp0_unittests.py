@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""exp1 -- run Swift's unit-test suite *inside the VSAIO development VM*.
+"""exp0 -- run Swift's unit-test suite on a Linux development machine.
 
 What this measures
 ------------------
@@ -9,35 +9,34 @@ before it is a pre-existing failure, not a regression we caused.
 
 Where it runs, and the two directories involved
 -----------------------------------------------
-There are **two different checkouts**, and they are not the same tree:
+Two layouts are supported, and this repo is normally the first one:
 
-1. **This course repo** (`ec528-fall26/swift`) -- contains `experiments/` and
-   `docs/`. The experiments contract requires running "from the repository
-   root", so this is where you stand when you invoke the script.
-2. **The upstream Swift source** -- the git checkout that actually contains
-   `test/unit`. Inside the VSAIO VM this is `/vagrant/swift`, which the
-   mentoring guide describes as "a normal git checkout of Swift ... shared with
-   your host machine".
+1. **fork-as-both (EC528)** -- this repo **is** a fork of Swift, so it contains
+   `swift/`, `test/unit/`, and `experiments/` in a single tree. The tree under
+   test is therefore this repo itself, and no `--swift-src` is needed.
+2. **VSAIO (two checkouts)** -- the course repo and the Swift source are separate
+   clones, e.g. `/vagrant/swift` inside the Vagrant dev VM.
 
-The script therefore runs from (1) but tests (2), and discovers (2)
-independently rather than assuming they are the same directory.
+Either way the script runs from this repo's root (the experiments contract
+requires that) and discovers the tree holding `test/unit` independently, rather
+than assuming the two are the same directory. `--swift-src` and `$SWIFT_SRC`
+override the search; repo-relative candidates resolve against this repo, so the
+result does not depend on your current directory.
 
-Inside `vagrant ssh`:
+On the EC528 Lightsail box:
 
-    cd /relative/or/absolute/path/to/parent-of-this-repo's-name
-    python3 experiments/exp1_unittests_in_vm.py
+    cd /opt/ec528-swift
+    source .venv/bin/activate
+    python3 experiments/exp0_unittests.py
 
-Concretely, with this repo at `/vagrant/ec528-swift` and Swift at `/vagrant/swift`:
+On VSAIO, with this repo at `/vagrant/ec528-swift` and Swift at `/vagrant/swift`:
 
     cd /vagrant/ec528-swift
-    python3 experiments/exp1_unittests_in_vm.py --swift-src /vagrant/swift
+    python3 experiments/exp0_unittests.py --swift-src /vagrant/swift
 
-If Swift is not found automatically, pass `--swift-src` or export `$SWIFT_SRC`.
-The script prints both roots so a mismatch is visible immediately.
-
-Run from your laptop without logging in first (adjust the repo path):
-
-    vagrant ssh -c 'cd <this-repo-root> && python3 experiments/exp1_unittests_in_vm.py'
+Setup (system packages, the XFS scratch filesystem the suite requires, and the
+virtualenv) is automated by `experiments/setup.sh`. See the design document's
+Setup section for the pinned versions.
 
 Why not on the host
 -------------------
@@ -81,19 +80,37 @@ EXIT_SKIP = 77
 #   *script root*  -- this course repo (ec528-fall26/swift). The experiments
 #                     contract says a script must run "from the repository root",
 #                     so this is the cwd the grader uses.
-#   *swift source* -- the upstream Swift checkout that actually contains
-#                     test/unit. Inside the VM that is /vagrant/swift, which is
-#                     a different repo entirely.
+#   *swift source* -- the Swift checkout that actually contains test/unit.
+#
+# There are two deployments this has to work in:
+#
+#   (a) VSAIO / two-checkout: the course repo and the Swift source are separate
+#       clones, so the Swift tree lives at /vagrant/swift or next to the repo.
+#   (b) fork-as-both: this repo IS a fork of Swift, so it contains test/unit and
+#       experiments/ in one tree. That is the layout used for EC528, and it is
+#       why REPO-RELATIVE candidates below are resolved against the *script
+#       root* rather than the cwd -- resolving them against the cwd made the
+#       candidates depend on where the caller happened to stand.
 #
 # So the Swift checkout is discovered independently of where the script lives.
 # $SWIFT_SRC is consulted at call time (not import time) so exporting it in the
 # current shell always takes effect.
-FALLBACK_SWIFT_DIRS = (
+FORK_LAYOUT_DOC = "--swift-src <the clone that contains test/unit>"
+
+# Candidates resolved against the SCRIPT ROOT (this repo). A fork of Swift is
+# its own tree, so "." is the primary answer for the EC528 layout.
+REPO_RELATIVE_SWIFT_DIRS = (
+    ".",                                     # fork-as-both: repo holds test/unit
+    "swift",
+)
+
+# Candidates resolved against the CWD, for the VSAIO / two-checkout layout.
+CWD_RELATIVE_SWIFT_DIRS = (
     "/vagrant/swift",                        # the VSAIO default
+    "/opt/swift",
     "~/swift",
     "../swift",                              # VSAIO host layout
     "../../vagrant-swift-all-in-one/swift",  # sibling checkout
-    "swift",
 )
 
 # test/unit/__init__.py imports these at module scope. A missing one aborts
@@ -144,7 +161,12 @@ def describe_environment() -> dict:
 
 
 def in_vm() -> bool:
-    """Heuristic: are we inside the VSAIO VM rather than a Windows/macOS host?"""
+    """Heuristic: a Linux box rather than a Windows/macOS host.
+
+    Swift is 'Operating System :: POSIX :: Linux' only, so Linux is the real
+    requirement. This covers both supported deployments: the VSAIO VM and a
+    standalone Linux instance (e.g. the EC528 Lightsail box).
+    """
     if sys.platform.startswith("linux"):
         return True
     return False
@@ -157,19 +179,26 @@ def script_root() -> Path:
 
 def find_swift_src(explicit: str | None,
                    verbose: bool = False) -> tuple[Path | None, list[Path]]:
-    """Locate the upstream Swift checkout (the tree holding test/unit).
+    """Locate the Swift checkout (the tree holding test/unit).
 
-    Deliberately independent of where this script lives: the course repo and
-    the Swift source are two different checkouts.  Returns (found, tried) so the
-    caller can show the candidate list when discovery fails.
+    Deliberately independent of where this script lives, because in the VSAIO
+    layout the course repo and the Swift source are two different checkouts.
+    In the EC528 layout they are the same tree (this repo is a fork of Swift),
+    which is why the repo-relative candidates are tried first.
+
+    Returns (found, tried) so the caller can show the candidate list when
+    discovery fails.
     """
     tried: list[Path] = []
 
-    def consider(raw: str) -> Path | None:
+    def consider(raw: str, base: Path | None = None) -> Path | None:
         if not raw:
             return None
         try:
-            p = Path(raw).expanduser().resolve()
+            p = Path(raw).expanduser()
+            if not p.is_absolute() and base is not None:
+                p = base / p
+            p = p.resolve()
         except (OSError, RuntimeError):
             return None
         if p in tried:
@@ -178,7 +207,20 @@ def find_swift_src(explicit: str | None,
         return p if (p / "test" / "unit").is_dir() else None
 
     if explicit:
-        return consider(explicit), tried
+        # An explicit path is authoritative: if it is wrong we report that,
+        # rather than quietly substituting a different tree and describing the
+        # wrong code. But say so, because a typo otherwise looks like "no tree".
+        found = consider(explicit)
+        if found is None:
+            say("")
+            say(f"  --swift-src {explicit} does not contain test/unit.")
+            say("  An explicit path is never silently overridden, because the")
+            say("  result would then describe a different tree than you asked for.")
+            repo_self = script_root()
+            if (repo_self / "test" / "unit").is_dir():
+                say(f"  This repo does contain test/unit:  {repo_self}")
+                say(f"  Retry without --swift-src, or:  --swift-src {repo_self}")
+        return found, tried
 
     # Read $SWIFT_SRC now, not at import time, so `export SWIFT_SRC=...` in the
     # current shell is honoured even if this module was imported earlier.
@@ -186,14 +228,24 @@ def find_swift_src(explicit: str | None,
     if found:
         return found, tried
 
-    for rel in FALLBACK_SWIFT_DIRS:
+    # 1. The script's own repo. This is the EC528 layout: a Swift fork holding
+    #    test/unit and experiments/ in one tree. Checked first because it is
+    #    what this artifact actually ships, and because it makes the scripts
+    #    work with no --swift-src at all.
+    root = script_root()
+    for rel in REPO_RELATIVE_SWIFT_DIRS:
+        found = consider(rel, base=root)
+        if found:
+            return found, tried
+
+    # 2. The VSAIO / two-checkout layout.
+    for rel in CWD_RELATIVE_SWIFT_DIRS:
         found = consider(rel)
         if found:
             return found, tried
 
-    # Last resort while the script is being developed on a host: a sibling
-    # Swift tree next to the course repo.
-    found = consider(str(script_root().parent / "swift"))
+    # Last resort while developing on a host: a Swift tree beside the repo.
+    found = consider(str(root.parent / "swift"))
     return found, tried
 
 
@@ -400,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="extra arguments passed through to pytest")
     args = parser.parse_args(argv)
 
-    say("Measuring: Swift unit-test suite health on the tree, inside the VSAIO VM")
+    say("Measuring: Swift unit-test suite health on the tree")
     say("           (this is the pre-fix baseline the fix will be measured against)")
 
     env = describe_environment()
@@ -411,39 +463,43 @@ def main(argv: list[str] | None = None) -> int:
     # -- host guard ---------------------------------------------------------
     if not in_vm():
         say("")
-        say("  This script is meant to run inside the development VM, where")
-        say("  ./.unittests is a valid command.  Swift declares")
+        say("  This script must run on Linux, where ./.unittests is a valid")
+        say("  command.  Swift declares")
         say("  'Operating System :: POSIX :: Linux', and its suite imports fcntl,")
         say("  grp and pwd -- none of which exist on Windows or macOS.")
         say("")
-        say("  It must run FROM THIS REPO's root, but the Swift source it tests is a")
-        say("  different checkout -- normally /vagrant/swift inside the VM.")
+        say("  It must run FROM THIS REPO's root.  In the fork-as-both layout the")
+        say("  tree under test is this repo itself; in the VSAIO layout it is a")
+        say("  separate checkout, normally /vagrant/swift.")
         say("")
-        say("  From your laptop:")
-        say("    vagrant ssh")
+        say("  On a Linux box (the authoritative environment):")
         say(f"    cd {script_root()}")
-        say("    python3 experiments/exp1_unittests_in_vm.py")
+        say("    python3 experiments/exp0_unittests.py")
         say("")
-        say("  See docs/design-document.md section 3 for the full setup.")
-        return finish(EXIT_SKIP, "SKIP (not inside the Linux development VM)")
+        say("  If the environment is not built yet, run experiments/setup.sh")
+        say("  first (see the design document's Setup section).")
+        return finish(EXIT_SKIP, "SKIP (not a Linux machine)")
 
     # -- locate the tree ----------------------------------------------------
     src, tried = find_swift_src(args.swift_src)
     banner("swift checkout")
     say(f"  script root  {script_root()}     (this course repo)")
     if src is None:
-        say("  swift source NOT FOUND.  The tree holding test/unit is a separate")
-        say("  checkout from this repository -- the script does not assume they are")
-        say("  the same directory.")
+        say("  swift source NOT FOUND -- no tree containing test/unit.")
         say("")
-        say("  Pass --swift-src PATH, or set $SWIFT_SRC.")
+        say("  This repo IS a fork of Swift, so the tree is normally this repo")
+        say(f"  itself ({script_root()}). If test/unit is not there, this is not")
+        say("  the Swift fork -- or the clone is incomplete.")
+        say("")
+        say("  Pass --swift-src PATH, or set $SWIFT_SRC, if the tree is elsewhere.")
         if tried:
             say("  Tried:")
             for p in tried:
                 say(f"    {p}")
         say("")
-        say("  Inside the VM the usual answer is:")
-        say("    --swift-src /vagrant/swift")
+        say("  Two layouts are supported:")
+        say("    fork-as-both (this repo)   --swift-src " + str(script_root()))
+        say("    VSAIO (two checkouts)      --swift-src /vagrant/swift")
         return finish(EXIT_SKIP, "SKIP (no Swift checkout found)")
 
     rev = detect_swift_revision(src)
@@ -556,7 +612,8 @@ def main(argv: list[str] | None = None) -> int:
     report["result"] = "PASS"
     _write_json(args.results_json, report)
     say("")
-    say("  Baseline is green.  Quote this in docs/design-document.md, together")
+    say("  Baseline is green.  Quote this in the design document's Setup and")
+    say("  Running-the-experiments sections, together")
     say("  with the commit above, as the pre-fix reference point.")
     return finish(EXIT_OK, "PASS (unit tests green)")
 

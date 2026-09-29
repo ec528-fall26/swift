@@ -65,15 +65,27 @@ TEST_CLASS = "TestRingBuilder"
 TEST_NAME = "test_save_partial_dump_does_nothing"
 TEST_REL = Path("test") / "unit" / "common" / "ring" / "test_builder.py"
 
-# The tree that actually holds test/unit is a separate checkout from the course
-# repo, so it is discovered independently.  $SWIFT_SRC is read at call time (not
-# at import time) so exporting it in the current shell always takes effect.
-FALLBACK_SWIFT_DIRS = (
-    "E:/GitHub/EC528_swift",                 # this task's fork
-    "E:/GitHub/swift",                       # older local checkout
+# The tree holding test/unit is discovered independently of where this script
+# lives, because there are two supported layouts:
+#
+#   fork-as-both (EC528) -- this repo IS a Swift fork, so it holds test/unit and
+#                           experiments/ in one tree. Repo-relative, tried first.
+#   VSAIO (two clones)   -- the course repo and the Swift source are separate
+#                           checkouts, e.g. /vagrant/swift.
+#
+# Repo-relative candidates resolve against the SCRIPT ROOT, not the cwd, so the
+# result does not depend on where the caller happened to stand. $SWIFT_SRC is
+# read at call time (not at import time) so exporting it always takes effect.
+REPO_RELATIVE_SWIFT_DIRS = (
+    ".",                                     # fork-as-both: repo holds test/unit
+    "swift",
+)
+
+CWD_RELATIVE_SWIFT_DIRS = (
     "/vagrant/swift",                        # the VSAIO default
+    "/opt/swift",
     "~/swift",
-    "../swift",
+    "../swift",                              # VSAIO host layout
     "swift",
 )
 
@@ -335,15 +347,23 @@ def install_windows_shim() -> None:
 # locating the tree
 # --------------------------------------------------------------------------
 
+def script_root() -> Path:
+    """This repo's root -- the experiments/ -> .. hop, where this script lives."""
+    return Path(__file__).resolve().parents[1]
+
+
 def find_swift_src(explicit: str | None) -> tuple[Path | None, list[Path]]:
     """Locate the Swift checkout (the tree holding test/unit)."""
     tried: list[Path] = []
 
-    def consider(raw: str) -> Path | None:
+    def consider(raw: str, base: Path | None = None) -> Path | None:
         if not raw:
             return None
         try:
-            path = Path(raw).expanduser().resolve()
+            path = Path(raw).expanduser()
+            if not path.is_absolute() and base is not None:
+                path = base / path
+            path = path.resolve()
         except (OSError, RuntimeError):
             return None
         if path in tried:
@@ -352,13 +372,32 @@ def find_swift_src(explicit: str | None) -> tuple[Path | None, list[Path]]:
         return path if (path / "test" / "unit").is_dir() else None
 
     if explicit:
-        return consider(explicit), tried
+        # An explicit path is authoritative: if it is wrong we report that,
+        # rather than quietly substituting another tree and testing the wrong
+        # code. But say so, because a typo otherwise looks like "no tree".
+        found = consider(explicit)
+        if found is None:
+            say("")
+            say(f"  --swift-src {explicit} does not contain test/unit.")
+            repo_self = script_root()
+            if (repo_self / "test" / "unit").is_dir():
+                say(f"  This repo does contain test/unit:  {repo_self}")
+                say(f"  Retry without --swift-src, or:  --swift-src {repo_self}")
+        return found, tried
 
     found = consider(os.environ.get("SWIFT_SRC", ""))
     if found:
         return found, tried
 
-    for rel in FALLBACK_SWIFT_DIRS:
+    # 1. This repo. The EC528 layout: a Swift fork holding test/unit.
+    root = script_root()
+    for rel in REPO_RELATIVE_SWIFT_DIRS:
+        found = consider(rel, base=root)
+        if found:
+            return found, tried
+
+    # 2. The VSAIO / two-checkout layout.
+    for rel in CWD_RELATIVE_SWIFT_DIRS:
         found = consider(rel)
         if found:
             return found, tried
@@ -580,7 +619,11 @@ def main(argv: list[str] | None = None) -> int:
     src, tried = find_swift_src(args.swift_src)
     banner("swift checkout")
     if src is None:
-        say("  NOT FOUND.  Pass --swift-src PATH, or set $SWIFT_SRC.")
+        say("  NOT FOUND -- no tree containing test/unit.")
+        say("")
+        say("  This repo IS a fork of Swift, so the tree is normally this repo")
+        say(f"  itself ({script_root()}).")
+        say("  Pass --swift-src PATH, or set $SWIFT_SRC, if it is elsewhere.")
         if tried:
             say("  Tried:")
             for path in tried:
