@@ -49,8 +49,10 @@
 # tests do not fail -- they SKIP, and upstream's README warns it is "a very large
 # number". A run on ext4 therefore looks green while measuring almost nothing.
 # This script mounts an XFS loopback image at /tmp and *verifies* that an 8 KB
-# xattr can actually be written, because mounting XFS with agcount=1 does not by
-# itself guarantee enough inline attribute space.
+# xattr can actually be written. The probe is the point: XFS accepts attributes
+# larger than ext4's ~4 KB limit, but "the mount succeeded" is not the same claim
+# as "an 8 KB attribute is accepted here", and only the second is what the suite
+# needs.
 #
 # Pass --skip-xfs only if you know /tmp is already XFS with large xattrs. The
 # script still probes, and warns loudly if the probe fails.
@@ -308,8 +310,12 @@ else
 
         # format if it does not already carry an XFS signature
         if ! $SUDO xfs_admin -l "$XFS_IMAGE" >/dev/null 2>&1; then
-            # agcount=1 keeps the first AG large; -m crc=1 is the modern default
-            if ! $SUDO mkfs.xfs -f -m crc=1 -d agcount=1 "$XFS_IMAGE" >/dev/null; then
+            # -m crc=1 is the modern default. Deliberately no -d agcount=1:
+            # xfsprogs >= 5 refuses it ("Filesystem must have at least 2
+            # superblocks for redundancy!"), and AG count has nothing to do
+            # with the inline attribute space this step exists to guarantee.
+            # Let mkfs.xfs pick the geometry for the image size.
+            if ! $SUDO mkfs.xfs -f -m crc=1 "$XFS_IMAGE" >/dev/null; then
                 bad "mkfs.xfs failed"
                 finish "$EXIT_FAIL" "FAIL (mkfs.xfs)"
             fi
