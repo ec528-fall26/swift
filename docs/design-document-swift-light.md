@@ -5,7 +5,34 @@
 
 ## 1. Architecture
 
-What you actually built — not what you originally planned. Include a diagram.
+`swift_light` is a three-tier object store laid out the way upstream Swift is: a client, a proxy
+tier, and a set of storage nodes, with no metadata master anywhere in the path. Placement comes
+from a consistent-hashing ring that every proxy holds a copy of, so any proxy can answer "where
+does this object live?". The ring is stored on disk, which makes it survives a crash.
+For each object the ring yields an ordered list of servers that may
+hold it: the primary first, then the remaining replicas, then a set of substitutes further down
+the list.  
+A client asks the proxy for that list, then talks to the storage nodes directly.
+A write goes down the list until enough replicas have durably
+accepted the object, so a write still succeeds while a replica is down, because a substitute
+takes its place; the write is only reported as failed if too few replicas acknowledge. A read
+goes to the primary first and falls back down the list if the primary is unreachable or does not
+have the object. Storage nodes are stateless
+HTTP front ends over a plain on-disk store, so a restart loses nothing. When a node is
+unreachable, a substitute holds the object on its behalf until the owner returns, and on boot
+each node reconciles in both directions — collecting what others are holding for it and handing
+back what it is holding for them — so a node that was down rejoins without losing or orphaning
+data.  
+Health is checked by the proxy, which probes the nodes it knows and treats a node as
+failed once it has been quiet for a while; a dead node never takes the proxy down with it.
+What makes this system more than a re-implementation is that the same atomic-save rule applys on every durable write,
+from the smallest piece of node state up to the ring itself. The
+rule is always the same: never modify a file in place — build the new version beside the old
+one, flush it all the way to storage, then swap it in as a single atomic step and flush the
+directory, so a reader or a reboot sees either the complete old version or the complete new one
+and never a half-written one.
+
+<img src="Pictures/swift-light-architecturt-actual.png" width="600">
 
 ## 2. Design decisions
 
