@@ -22,7 +22,7 @@ cd <cloned swift repo directory>
 bash experiments/bug_fix/setup.sh
 ```
 
-What it does, in order:
+What the script does
 
 | Step | What happens |
 | --- | --- |
@@ -44,9 +44,6 @@ Exit codes:
 | `0` | Environment is ready (or, with `--check`, verified good). |
 | `1` | Something failed during provisioning |
 | `77` | Refused to run: wrong OS, no root/sudo, or a hard prerequisite missing. |
-
-A `77` is never a pass and never a failure: it describes the environment, not
-the code.
 
 ## 4. Running the experiments
 
@@ -75,10 +72,9 @@ echo "exit=$?"
 The first run of these experiments reports exactly **one**
 failing test — `TestRingBuilder.test_save_partial_dump_does_nothing`, the
 reproduction we added in this branch, which pins the bug in
-`RingBuilder.save()`. That single failure *is* the bug, so it is expected.
+`RingBuilder.save()`. That single failure is the bug, so it is expected.
 After the atomic-save fix is applied, re-run the same commands: that
-test passes and the suite reports zero failures, so **all tests pass** and any
-remaining failure would be a regression from our change.
+test passes and the suite reports zero failures.
 
 ### Experiment 1: `RingBuilder.save()` is not atomic (the bug we fix)
 
