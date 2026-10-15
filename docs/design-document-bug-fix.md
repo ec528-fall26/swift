@@ -14,6 +14,8 @@ Include the things that did not work.
 
 ## 3. Setup
 
+### Setup on a new machine
+
 The whole environment is built by one script. On a clean Ubuntu 24.04 machine:
 
 ```bash
@@ -45,6 +47,14 @@ Exit codes:
 | `1` | Something failed during provisioning |
 | `77` | Refused to run: wrong OS, no root/sudo, or a hard prerequisite missing. |
 
+### Using the team's LightSail instance
+
+The team has a LightSail instance with Ubuntu 24.04 with setup completed.
+It is possible to access the instance `SwiftBugFix` after accepting the email invitation to the team's
+AWS project. This can be done by clicking `Connect using SSH` in the LightSail dashboard.
+
+![LightSail dashboard for the SwiftBugFix instance, showing the "Connect using SSH" button](Pictures/Screenshot%202026-10-15%20090839.png)
+
 ## 4. Running the experiments
 
 ### Experiment 0: Running all unit tests
@@ -60,14 +70,25 @@ Exit codes:
 cd <cloned swift repo directory>
 source .venv/bin/activate
 
-# Record the baseline as JSON -- you will diff this against the post-fix run
 python experiments/exp0_unittests.py \
     --swift-src /opt/ec528-swift \
     --results-json baseline.json \
     --timeout 1800
 echo "exit=$?"
 ```
- 
+
+In the team's lightsail instance
+
+```bash
+cd home/ubuntu/EC528_swift
+source .venv/bin/activate
+
+python3 experiments/exp0_unittests.py \
+    --swift-src /opt/ec528-swift \
+    --results-json baseline.json \
+    --timeout 1800
+echo "exit=$?"
+```
 
 The first run of these experiments reports exactly **one**
 failing test — `TestRingBuilder.test_save_partial_dump_does_nothing`, the
@@ -89,6 +110,15 @@ test passes and the suite reports zero failures.
 cd <cloned swift repo directory>
 source .venv/bin/activate
 python experiments/exp1_run_partial_dump_test.py
+echo "exit=$?"
+```
+
+In the team's LightSail instance
+
+```bash
+cd home/ubuntu/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp1_run_partial_dump_test.py
 echo "exit=$?"
 ```
 
