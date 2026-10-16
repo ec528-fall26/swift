@@ -90,19 +90,56 @@ python3 src/swift_light/deploy.py down
 
 ## 4. Running the experiments
 
-One entry per claim you make. Someone else runs these; you do not get to
-explain them in person.
+Both experiments need the cluster running, so start it first, in another terminal:
 
-### Experiment 1: <the claim this supports>
+```bash
+python3 src/swift_light/deploy.py up
+```
+
+They also expect the team's files under `SwiftLightFiles/`, in particular:
+
+```
+SwiftLightFiles/Hello.txt
+```
+
+### Experiment 1: a write is durable on a quorum of data servers
 
 | | |
 | --- | --- |
-| Supports | <which figure, table, or statement in your slides> |
-| Command | `experiments/<script>.sh` |
-| Expected runtime | <minutes> |
-| Expected output | <what they should see, and what counts as a match> |
+| Supports | The write path in section 1: the client asks the proxy for the key's fan, then walks it until `replicate_count` servers have durably accepted. |
+| Command | `python3 experiments/swift_light/exp1_write_file.py` |
+| Expected runtime | Seconds. |
+| Expected output | A line per phase — the file and its SHA-256, the object key, the fan the proxy returned — then `wrote '<key>' to 2/2 replicas` with the servers that accepted, ending in `OK: <n> bytes stored on 2 data servers (sha256 ...)`. Exit `0`. |
 
-### Experiment 2: <...>
+```bash
+cd <cloned swift repo directory>
+
+python3 experiments/swift_light/exp1_write_file.py
+echo "exit=$?"
+```
+
+This uploads `SwiftLightFiles/Hello.txt` into the cluster under the path
+`MyTxtFiles/Hello.txt`, which the cluster files as the key
+`<login>-MyTxtFiles-Hello.txt`.
+
+### Experiment 2: a read returns the same bytes
+
+| | |
+| --- | --- |
+| Supports | The read path in section 1: the client reads from the primary (`fan[0]`) and says so when another server answers instead. |
+| Command | `python3 experiments/swift_light/exp2_read_file.py` |
+| Expected runtime | Seconds. |
+| Expected output | The fan, then `fetched '<key>' (<n> bytes) from <server> (primary)`, `wrote SwiftLightFiles/Hello_downloaded.txt`, and `OK: SwiftLightFiles/Hello_downloaded.txt is identical to SwiftLightFiles/Hello.txt`. Exit `0`. |
+| Requires | Experiment 1 to have run first. Without the object the script exits `1` and names the command to run. |
+
+```bash
+python3 experiments/swift_light/exp2_read_file.py
+echo "exit=$?"
+```
+
+This downloads `MyTxtFiles/Hello.txt` into `SwiftLightFiles/Hello_downloaded.txt`
+and checks it byte-for-byte against the original `SwiftLightFiles/Hello.txt`, so
+a short read or a stale replica fails instead of passing quietly.
 
 ## 5. Claims and limitations
 
