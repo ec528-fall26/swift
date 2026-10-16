@@ -80,7 +80,7 @@ echo "exit=$?"
 In the team's lightsail instance
 
 ```bash
-cd home/ubuntu/EC528_swift
+cd /home/ubuntu/EC528_swift
 source .venv/bin/activate
 
 python3 experiments/exp0_unittests.py \
@@ -116,7 +116,7 @@ echo "exit=$?"
 In the team's LightSail instance
 
 ```bash
-cd home/ubuntu/EC528_swift
+cd /home/ubuntu/EC528_swift
 source .venv/bin/activate
 python3 experiments/exp1_run_partial_dump_test.py
 echo "exit=$?"

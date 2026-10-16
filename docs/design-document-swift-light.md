@@ -90,17 +90,9 @@ python3 src/swift_light/deploy.py down
 
 ## 4. Running the experiments
 
-Both experiments need the cluster running, so start it first, in another terminal:
+All experiments need the cluster running. Once the setup process is completed, experiments can be run in a separate terminal.
 
-```bash
-python3 src/swift_light/deploy.py up
-```
-
-They also expect the team's files under `SwiftLightFiles/`, in particular:
-
-```
-SwiftLightFiles/Hello.txt
-```
+They also expect the team's files `SwiftLightFiles/Hello.txt`.
 
 ### Experiment 1: a write is durable on a quorum of data servers
 
@@ -109,10 +101,19 @@ SwiftLightFiles/Hello.txt
 | Supports | The write path in section 1: the client asks the proxy for the key's fan, then walks it until `replicate_count` servers have durably accepted. |
 | Command | `python3 experiments/swift_light/exp1_write_file.py` |
 | Expected runtime | Seconds. |
-| Expected output | A line per phase — the file and its SHA-256, the object key, the fan the proxy returned — then `wrote '<key>' to 2/2 replicas` with the servers that accepted, ending in `OK: <n> bytes stored on 2 data servers (sha256 ...)`. Exit `0`. |
+| Expected output |`wrote '<key>' to 2/2 replicas` |
 
 ```bash
 cd <cloned swift repo directory>
+
+python experiments/swift_light/exp1_write_file.py
+echo "exit=$?"
+```
+
+In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
 
 python3 experiments/swift_light/exp1_write_file.py
 echo "exit=$?"
@@ -129,12 +130,39 @@ This uploads `SwiftLightFiles/Hello.txt` into the cluster under the path
 | Supports | The read path in section 1: the client reads from the primary (`fan[0]`) and says so when another server answers instead. |
 | Command | `python3 experiments/swift_light/exp2_read_file.py` |
 | Expected runtime | Seconds. |
-| Expected output | The fan, then `fetched '<key>' (<n> bytes) from <server> (primary)`, `wrote SwiftLightFiles/Hello_downloaded.txt`, and `OK: SwiftLightFiles/Hello_downloaded.txt is identical to SwiftLightFiles/Hello.txt`. Exit `0`. |
-| Requires | Experiment 1 to have run first. Without the object the script exits `1` and names the command to run. |
+| Expected output | `fetched '<key>' (<n> bytes) from <server> (primary)` |
+| Requires | Experiment 1 to have run first. |
 
 ```bash
+cd <cloned swift repo directory>
+
+python experiments/swift_light/exp2_read_file.py
+echo "exit=$?"
+```
+
+Optional: to take a look at the downloaded file
+
+```bash
+cd <cloned swift repo directory>/SwiftLightFiles
+
+<your favorite text editor> Hello_downloaded.txt
+```
+
+In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
 python3 experiments/swift_light/exp2_read_file.py
 echo "exit=$?"
+```
+
+Optional: to take a look at the downloaded file
+
+```bash
+cd /home/ubuntu/swift/SwiftLightFiles
+
+emacs Hello_downloaded.txt
 ```
 
 This downloads `MyTxtFiles/Hello.txt` into `SwiftLightFiles/Hello_downloaded.txt`
