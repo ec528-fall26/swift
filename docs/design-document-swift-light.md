@@ -103,6 +103,8 @@ They also expect the team's files `SwiftLightFiles/Hello.txt`.
 | Expected runtime | Seconds. |
 | Expected output |`wrote '<key>' to 2/2 replicas` |
 
+#### How to run the experiment
+
 ```bash
 cd <cloned swift repo directory>
 
@@ -110,7 +112,7 @@ python experiments/swift_light/exp1_write_file.py
 echo "exit=$?"
 ```
 
-In the team's LightSail instance
+#### In the team's LightSail instance
 
 ```bash
 cd /home/ubuntu/swift
@@ -133,6 +135,8 @@ This uploads `SwiftLightFiles/Hello.txt` into the cluster under the path
 | Expected output | `fetched '<key>' (<n> bytes) from <server> (primary)` |
 | Requires | Experiment 1 to have run first. |
 
+#### How to run the experiment
+
 ```bash
 cd <cloned swift repo directory>
 
@@ -148,7 +152,7 @@ cd <cloned swift repo directory>/SwiftLightFiles
 <your favorite text editor> Hello_downloaded.txt
 ```
 
-In the team's LightSail instance
+#### In the team's LightSail instance
 
 ```bash
 cd /home/ubuntu/swift
@@ -171,6 +175,19 @@ a short read or a stale replica fails instead of passing quietly.
 
 ## 5. Claims and limitations
 
-What your artifact supports, and an honest account of what does not work or was
-not tested. *An honest narrower result scores better than an impressive result we
-cannot reproduce.*
+### Claims
+
+### What we aim to solve in Demo3
+
+- We currently don't have experiments testing the system during network partition and machine failures because we haven't
+implemented logic simulating these situations such as manually shutting a data server down.
+- Due to the lack of metric tracking logic, it's currently impossible to see what's inside the hashing ring and data server
+file systems. These are crucial for a system built for testing purposes.
+
+### Limitations
+
+- Swift uses SQLite for its metadata: each account and container server keeps the object
+listings in a local SQLite database, and the replicator reads those databases to find and
+repair stale copies. We left this out because it is irrelevant to what we are testing: the
+experiments cover placement, quorum writes, and read fallback, not listing or container
+operations and not background replication. 
