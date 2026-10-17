@@ -7,6 +7,13 @@ target/
 *.pyc
 __pycache__/
 
+# swift_light local cluster state (deploy.py writes these; the ring is a
+# runtime layout, not source -- delete the ignore rules to commit a demo cluster)
+src/swift_light/proxy_server/ring.json
+src/swift_light/proxy_server/ring.json.temp
+src/swift_light/proxy_server/balanced_ring.json
+src/swift_light/data_server/cluster/
+
 # Environments
 .venv/
 venv/

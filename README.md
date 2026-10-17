@@ -28,7 +28,7 @@ on a dev cluster, fix it with a failing-then-passing test, and push it through G
 
 ## Reproducing our results
 
-See [`docs/design-document.md`](docs/design-document.md). Every claim we make in a
+See [`docs/design-document-swift-light.md`](docs/design-document-swift-light.md). Every claim we make in a
 demo or in the final presentation has a corresponding script in `experiments/`.
 
 ## Submission checklist
@@ -40,6 +40,6 @@ on the day of that demo. See the
 | Deliverable | Branch | Must contain |
 | --- | --- | --- |
 | Demo 1 | `demo-1` | slides, code, `docs/design-proposal.md` |
-| Demo 2 | `demo-2` | slides, code, `docs/design-document.md`, demo video |
-| Demo 3 | `demo-3` | slides, code, updated `docs/design-document.md`, demo video |
+| Demo 2 | `demo-2` | slides, code, `docs/design-document-swift-light.md`, demo video |
+| Demo 3 | `demo-3` | slides, code, updated `docs/design-document-swift-light.md`, demo video |
 | Final | `final-demo` | slides, code, artifact documentation, recorded video presentation |
