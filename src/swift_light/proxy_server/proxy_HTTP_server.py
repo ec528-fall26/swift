@@ -25,6 +25,12 @@ module is only a thin HTTP skin over it:
     POST /heartbeat   re-probe every data server now, then answer as above
     GET  /nodes       every data server in the cluster, for handoff reconciliation
 
+A re-probe is also where reconnection is noticed.  A data server that had been
+counted failed and answers again is asked to reconcile its handoffs
+(``POST <data server>/handoff``): the proxy routed its objects to substitutes
+while it was unreachable, and those entries have to come home.  This is the
+same reconciliation the data server runs at boot.
+
 Which data servers exist is not a second list kept here.  Startup loads the
 cluster's persisted ring once and keeps it on the proxy, then heartbeats every
 node it lists -- so the proxy's view of membership and the ring's can never
@@ -80,6 +86,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -97,6 +104,7 @@ __all__ = [
     "DEFAULT_USER_PORT",
     "DEFAULT_DATA_PORT",
     "DEFAULT_HOST",
+    "DEFAULT_RECONCILE_TIMEOUT",
 ]
 
 DEFAULT_USER_PORT = 8000
@@ -107,6 +115,9 @@ DEFAULT_DATA_PORT = 8010
 
 DEFAULT_HOST = ""
 """Bind address: the empty string binds every interface."""
+
+DEFAULT_RECONCILE_TIMEOUT = 2.0
+"""Seconds to wait for a reconnected data server to accept a reconcile request."""
 
 
 class _ProxyRequestServer(ThreadingHTTPServer):
@@ -182,6 +193,9 @@ class DataServerHandler(_JsonHandler):
         GET  /heartbeat   the status of every data server the proxy knows
         POST /heartbeat   re-probe every data server, then report the status
         GET  /nodes       every data server in the cluster, straight from the ring
+
+    A re-probe also detects reconnection: a server that had failed and answers
+    is asked to run its handoff reconciliation again.
 
     Anything else is a ``404``.  A method with no route is left to
     ``BaseHTTPRequestHandler``, which answers ``501 Not Implemented``.
@@ -327,11 +341,42 @@ class ProxyHTTPServer:
         The ring is the membership, exactly as at startup, so a re-probe covers
         the same servers the boot probe did.  Probes are serialized under one
         lock; two re-probes at once would only race each other.
+
+        A server that was failed before this probe and answers it has
+        reconnected.  Handoffs were routed to substitutes while it was gone, so
+        it is asked to reconcile them again -- after the lock is released, so a
+        slow reconcile request never delays the next re-probe.
         """
+        recovered: list[str] = []
         with self._lock:
+            before = self.heartbeat.get_status()
             for server in self.ring.nodes:
+                was_lost = server in before and not before[server]["healthy"]
                 self.heartbeat.log_heartbeat(server)
-            return self.heartbeat.get_status()
+                if was_lost and self.heartbeat.is_alive(server):
+                    recovered.append(server)
+        for server in recovered:
+            self._request_handoff_reconcile(server)
+        return self.heartbeat.get_status()
+
+    def _request_handoff_reconcile(self, server: str) -> None:
+        """Ask a reconnected data server to reconcile its handoffs now.
+
+        Best effort: the server answered a heartbeat a moment ago, but it can
+        still fail or time out here, and that must not disturb the re-probe.
+        The data server acknowledges before it starts collecting, so this
+        returns without waiting for its peers.
+        """
+        request = urllib.request.Request(
+            server.rstrip("/") + "/handoff", data=b"", method="POST"
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=DEFAULT_RECONCILE_TIMEOUT
+            ):
+                pass
+        except Exception:  # noqa: BLE001 - best effort, like the data server's sync
+            pass
 
     # -- lifecycle ----------------------------------------------------------
 

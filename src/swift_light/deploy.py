@@ -43,12 +43,15 @@ copies of every object, and supervises four processes.  ``--nodes`` and
 Order of events
 ---------------
 The proxy is started first, then the data servers.  A data server reconciles
-handoffs once, at boot, by asking the proxy's ``/nodes`` route which peers
-exist, so the proxy has to be answering before they start -- otherwise that
-reconciliation is simply lost (it is best-effort and never retried).  The
-proxy's own boot probe of the data servers is allowed to fail, so starting it
-first costs nothing: after the data servers are up, ``up`` re-probes them
-through the proxy's ``POST /heartbeat`` and prints the refreshed health.
+handoffs at boot by asking the proxy's ``/nodes`` route which peers exist, so
+the proxy has to be answering before they start -- otherwise that boot
+reconciliation is simply lost (it is best-effort).  The proxy's own boot probe
+of the data servers is allowed to fail, so starting it first costs nothing:
+after the data servers are up, ``up`` re-probes them through the proxy's
+``POST /heartbeat`` and prints the refreshed health.  A later ``POST
+/heartbeat`` that sees a data server answer after a failed probe also asks that
+server to reconcile its handoffs again, which is how a server that stayed up
+through a failure collects what was routed elsewhere while it was unreachable.
 
 State
 -----

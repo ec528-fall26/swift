@@ -14,6 +14,7 @@ the port the server persisted as its ``own_address``::
     GET    /handoff?owner=<url>         list the keys held for that owner
     GET    /handoff?owner=<url>&key=<k> read one handoff held for that owner
     DELETE /handoff?owner=<url>&key=<k> clear one handoff once it is collected
+    POST   /handoff                     reconcile handoffs now
 
 The heartbeat body is exactly
 :func:`~swift_light.data_server.heartbeat.heartbeat_response`::
@@ -36,7 +37,9 @@ proxy leaves the object on a substitute, filed under the owner's address.  Those
 *handoff* entries are the fourth family of route.  At boot the server reconciles
 them (:mod:`swift_light.data_server.handoff`) -- it asks the proxy for its peers,
 collects the handoffs they hold for it, and delivers the ones it holds to their
-owners.
+owners.  The proxy asks for the same reconciliation again whenever its heartbeat
+probe shows this server reconnecting after it had been counted failed, because
+handoffs were routed elsewhere for as long as it was unreachable.
 
 Address
 -------
@@ -234,6 +237,7 @@ class DataHandler(_JsonHandler):
         GET /handoff?owner=<url>         list the keys held for that owner
         GET /handoff?owner=<url>&key=<k> read one handoff held for that owner
         DELETE /handoff?owner=<url>&key=<k> clear one handoff once it is collected
+        POST /handoff                    reconcile handoffs now
 
     The heartbeat body is
     :func:`~swift_light.data_server.heartbeat.heartbeat_response`, built from the
@@ -244,6 +248,8 @@ class DataHandler(_JsonHandler):
     The handoff routes answer a booting server taking its borrowed objects back:
     ``owner`` names the node the entries belong to.  A read of a delete
     placeholder is a normal ``200`` whose ``X-Handoff-Delete`` header is ``true``.
+    ``POST /handoff`` is the same reconciliation on demand: the proxy sends it
+    when this server recovers from a failed heartbeat.
     """
 
     def do_GET(self) -> None:
@@ -264,6 +270,12 @@ class DataHandler(_JsonHandler):
     def do_PUT(self) -> None:
         if self._path() == "/files":
             self._write_file()
+        else:
+            self._send_not_found()
+
+    def do_POST(self) -> None:
+        if self._path() == "/handoff":
+            self._reconcile_handoffs()
         else:
             self._send_not_found()
 
@@ -392,6 +404,16 @@ class DataHandler(_JsonHandler):
         else:
             self._send_no_content()
 
+    def _reconcile_handoffs(self) -> None:
+        """Answer ``POST /handoff``: start a reconciliation, then return.
+
+        The proxy sends this when it sees this server recover from a failed
+        heartbeat.  A run already in flight will collect everything waiting,
+        so a second request is acknowledged without starting another.
+        """
+        started = self._data_server.request_handoff_reconcile()
+        self._send_json(202, {"started": started})
+
 
 class DataHTTPServer:
     """The data server's HTTP listener: one port, its routes.
@@ -419,6 +441,8 @@ class DataHTTPServer:
     Binding and serving are separate from reconciliation: :meth:`start` begins
     serving and then runs the boot handoff reconciliation once, in the
     background, so a slow or unreachable peer never delays the listener.
+    :meth:`request_handoff_reconcile` runs it again, which is what the proxy
+    asks for when a heartbeat shows this server recovering from a failure.
     """
 
     def __init__(
@@ -442,6 +466,7 @@ class DataHTTPServer:
         )
         self._thread: threading.Thread | None = None
         self._sync_thread: threading.Thread | None = None
+        self._sync_lock = threading.Lock()
         self.handoff_report: dict[str, Any] | None = None
 
     # -- address ------------------------------------------------------------
@@ -472,12 +497,7 @@ class DataHTTPServer:
             daemon=True,
         )
         self._thread.start()
-        self._sync_thread = threading.Thread(
-            target=self._reconcile_quietly,
-            name=f"data-server-handoff-{self.port}",
-            daemon=True,
-        )
-        self._sync_thread.start()
+        self.request_handoff_reconcile()
 
     def serve_forever(self) -> None:
         """Serve and block until interrupted, then close."""
@@ -498,6 +518,26 @@ class DataHTTPServer:
 
     # -- handoff reconciliation ---------------------------------------------
 
+    def request_handoff_reconcile(self) -> bool:
+        """Run a handoff reconciliation in the background if none is running.
+
+        Returns ``True`` when a run was started and ``False`` when one is
+        already in flight.  Boot calls this once, and the handler behind
+        ``POST /handoff`` calls it again when the proxy reports a reconnection.
+        The run already in flight is enough: it asks the proxy for the peer
+        list when it starts, so it collects everything waiting at that point.
+        """
+        with self._sync_lock:
+            if self._sync_thread is not None and self._sync_thread.is_alive():
+                return False
+            self._sync_thread = threading.Thread(
+                target=self._reconcile_quietly,
+                name=f"data-server-handoff-{self.port}",
+                daemon=True,
+            )
+            self._sync_thread.start()
+            return True
+
     def reconcile_handoffs(self) -> dict[str, Any]:
         """Collect this server's handoffs and deliver the ones it holds.
 
@@ -510,7 +550,7 @@ class DataHTTPServer:
         ).reconcile()
 
     def _reconcile_quietly(self) -> None:
-        """Run :meth:`reconcile_handoffs` at boot without ever failing startup."""
+        """Run :meth:`reconcile_handoffs` in the background without raising."""
         try:
             self.handoff_report = self.reconcile_handoffs()
         except Exception as exc:  # noqa: BLE001 - a boot step must not be fatal
