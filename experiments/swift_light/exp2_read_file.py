@@ -11,6 +11,9 @@ or does not hold the key.  The script downloads ``MyTxtFiles/Hello.txt`` into
 ``SwiftLightFiles/Hello_downloaded.txt`` and compares it byte-for-byte with the
 original, so a short read or a stale replica fails loudly instead of quietly.
 
+The script reports fallback if it happens; it does not force primary failure,
+so a normal passing run is not evidence that fallback works under failure.
+
 Prerequisites
 -------------
 The cluster must already be up::
@@ -153,7 +156,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SKIP
 
     client = _client.Client(user=args.user)
-    key = client.object_key(args.remote_path)
+    try:
+        key = client.object_key(args.remote_path)
+    except _client.ClientError as exc:
+        print(f"[exp2] invalid object path: {exc}", file=sys.stderr)
+        return EXIT_SKIP
     print(f"[exp2] object    {args.remote_path}  ->  key {key!r}")
     print(f"[exp2] account   {client.user!r}")
     print(f"[exp2] proxy     {_client.PROXY_BASE_URL}")

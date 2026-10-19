@@ -11,6 +11,10 @@ under the cluster path ``MyTxtFiles/Hello.txt``, and records the key the
 cluster filed it under and the SHA-256 of what went in, so that experiment 2
 can show the same bytes coming back out.
 
+After uploading, this experiment independently reads every acknowledging node
+and compares its bytes with the input. This verifies immediate replicated
+storage, not survival of a process crash or machine power loss.
+
 Prerequisites
 -------------
 The cluster must already be up.  This script never starts or stops it::
@@ -131,7 +135,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SKIP
 
     client = _client.Client(user=args.user)
-    key = client.object_key(args.remote_path)
+    try:
+        key = client.object_key(args.remote_path)
+    except _client.ClientError as exc:
+        print(f"[exp1] invalid object path: {exc}", file=sys.stderr)
+        return EXIT_SKIP
     print(f"[exp1] file      {args.file} ({len(data)} bytes, sha256 {_sha256(data)})")
     print(f"[exp1] object    {args.remote_path}  ->  key {key!r}")
     print(f"[exp1] account   {client.user!r}")
@@ -171,6 +179,24 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_FAIL
+
+    if (report['quorum'] < 1 or accepted < report['quorum'] or
+            len(set(report['acknowledged'])) != accepted):
+        print('[exp1] FAIL: invalid or duplicate acknowledgements', file=sys.stderr)
+        return EXIT_FAIL
+
+    # An acknowledgement alone does not establish that the bytes were stored.
+    # Read each acknowledged replica independently, bypassing client fallback.
+    for server in report['acknowledged']:
+        try:
+            status, stored = client._send('GET', server, key)
+        except _client.ClientError as exc:
+            print(f'[exp1] FAIL: cannot verify {server}: {exc}', file=sys.stderr)
+            return EXIT_FAIL
+        if status != 200 or stored != data:
+            print(f'[exp1] FAIL: stored bytes differ at {server}', file=sys.stderr)
+            return EXIT_FAIL
+        print(f'[exp1] verified bytes at {server}')
 
     print(
         f"[exp1] OK: {len(data)} bytes stored on {accepted} data servers "
