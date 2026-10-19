@@ -61,152 +61,213 @@ AWS project. This can be done by clicking `Connect using SSH` in the LightSail d
 
 | | |
 | --- | --- |
-| Supports | The "pre-fix reference point": Swift is fully functional before and after our fix. |
-| Command | `python3 experiments/exp0_unittests.py` |
+| Supports | Records Swift unit-suite results before and after the fix to detect regressions; passing unit tests does not establish full system correctness. |
+| Command | `python3 experiments/exp0_unittests.py --swift-src "$PWD"` |
 | Expected runtime | Up to 30 minutes (the script's own hard timeout). |
 | Expected output | A banner per phase — `environment`, `swift checkout`, `dependencies`, then pytest's own summary — ending in a `result` block with `elapsed`, `collected`, `failed`, `errors`, `skipped`, and the first failing tests if any. |
 
 ```bash
-cd <cloned swift repo directory>
+cd /path/to/EC528_swift
 source .venv/bin/activate
 
-python experiments/exp0_unittests.py \
-    --swift-src /opt/ec528-swift \
+python3 experiments/exp0_unittests.py \
+    --swift-src "$PWD" \
     --results-json baseline.json \
     --timeout 1800
 echo "exit=$?"
 ```
 
-In the team's lightsail instance
+#### In the team's LightSail instance
 
 ```bash
 cd /home/ubuntu/EC528_swift
 source .venv/bin/activate
 
 python3 experiments/exp0_unittests.py \
-    --swift-src /opt/ec528-swift \
+    --swift-src "$PWD" \
     --results-json baseline.json \
     --timeout 1800
 echo "exit=$?"
 ```
 
-The first run of these experiments reports exactly **one**
-failing test — `TestRingBuilder.test_save_partial_dump_does_nothing`, the
-reproduction we added in this branch, which pins the bug in
-`RingBuilder.save()`. That single failure is the bug, so it is expected.
-After the atomic-save fix is applied, re-run the same commands: that
-test passes and the suite reports zero failures.
+Record actual failures on each revision rather than assuming a fixed failure
+count. The existing mocked `test_save` needs updating for the atomic save.
+The partial-dump test can also fail its last comparison because loading adds
+replication fields absent from its device fixtures. Compare against a freshly
+loaded good builder, or populate those fields in the existing test, before
+using it as before/after evidence. The experiment 0 runner can also misclassify
+an entirely failing suite as aborted collection. Inspect pytest output and named failures, not only the
+final runner label.
 
-### Experiment 1: `RingBuilder.save()` is not atomic (the bug we fix)
+### Experiment 1: preservation after partial serialization
 
 | | |
 | --- | --- |
-| Supports | The demo-2 bug reproduction: killing the ring builder mid-update leaves a half-written builder file on disk, which is why a later ring position lookup fails with `does not contain valid composite ring data`. |
-| Command | `python3 experiments/exp1_run_partial_dump_test.py` |
-| Expected runtime | Seconds. It runs exactly one unit test, `TestRingBuilder.test_save_partial_dump_does_nothing`. |
-| Expected output | Before the fix: the test **fails** |
+| Supports | An injected partial-pickle failure preserves the previous individual-builder file and leaves it loadable. This does not kill a process or exercise composite metadata or ring-position lookups. |
+| Command | `python3 experiments/exp1_run_partial_dump_test.py --swift-src "$PWD"` |
+| Expected runtime | Normally seconds; the existing runner selects exactly `TestRingBuilder.test_save_partial_dump_does_nothing`. |
+| Expected output | Before the fix: failure on changed bytes. After the fix: should pass once the fixture comparison described above is corrected. A failure alone does not identify its cause. |
 
 ```bash
-cd <cloned swift repo directory>
+cd /path/to/EC528_swift
 source .venv/bin/activate
-python experiments/exp1_run_partial_dump_test.py
+python3 experiments/exp1_run_partial_dump_test.py --swift-src "$PWD"
+
 echo "exit=$?"
 ```
 
-In the team's LightSail instance
+#### In the team's LightSail instance
 
 ```bash
 cd /home/ubuntu/EC528_swift
 source .venv/bin/activate
-python3 experiments/exp1_run_partial_dump_test.py
+python3 experiments/exp1_run_partial_dump_test.py --swift-src "$PWD"
+
 echo "exit=$?"
 ```
 
-### Experiments 2–4: additional atomic-save claims
-
-These scripts live in the **course repository** under `experiments/bug_fix/`.
-They import the implementation from a separate upstream Swift checkout. On
-Linux, activate that checkout's prepared virtual environment and, from the
-course repository root, set:
-
-```bash
-source /path/to/EC528_swift/.venv/bin/activate
-export PYTHONPATH=/path/to/EC528_swift
-```
-
-### Experiment 2: individual-builder save failure safety
+### Experiment 2: process interruption leaves a complete old or new builder
 
 | | |
 | --- | --- |
-| Supports | An interrupted or failed individual-builder save preserves the previous valid builder. Successful saves follow the file-sync, rename, directory-sync order. |
-| Command | `python3 experiments/bug_fix/exp2_atomic_save_failures.py` |
-| Expected runtime | Normally seconds; allow up to 60 seconds for bounded child-process waits. |
-| Expected output | `Ran 4 tests` followed by `OK` when all checks pass. Expected to pass on the inspected `bugfix` implementation; not yet verified on Linux. The process-kill check should fail on `master`. |
+| Supports | Killing the writer before replacement preserves the previous builder; killing it just after replacement leaves the complete new builder loadable. |
+| Command | `python3 experiments/exp2_interrupted_save.py --swift-src "$PWD"` |
+| Expected runtime | Normally seconds; the complete worker has a 90-second default deadline. |
+| Expected output | Three named tests, followed by `Ran 3 tests`, `OK`, and `RESULT: PASS` when the checks pass. These are the expected successful results for the patched implementation. |
 
-The four checks:
+The experiment builds and saves a real, populated `RingBuilder`, records the
+original bytes and loaded state, then attempts a changed version in a child
+process. It pauses the writer at three controlled points: halfway through
+serialization, immediately before rename, and immediately after rename. The
+parent kills the paused child with `SIGKILL` and verifies the expected old or
+new state and individual partition-device lookups. Before replacement, it also
+checks that a later save succeeds despite any stale temporary file.
 
-1. Kill a child process after it writes half the serialized data. Verify that
-   the original builder is byte-identical and loadable, then verify that another
-   save succeeds despite any temporary file left by the killed process.
-2. Inject a file `fsync` error. Verify that the original survives and the
-   temporary file is removed.
-3. Inject a replacement error. Verify that the original survives and the
-   temporary file is removed.
-4. Record real file operations during a successful save. Verify that file
-   `fsync` completes before rename and directory `fsync` completes afterward.
+The post-rename check is about **process death with the OS still running**; it
+does not establish survival of power loss before the directory sync.
 
-From the course repository root, after the environment setup above:
+#### How to run the experiment
 
 ```bash
-python3 experiments/bug_fix/exp2_atomic_save_failures.py
+cd /path/to/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp2_interrupted_save.py --swift-src "$PWD"
+
 echo "exit=$?"
 ```
 
-### Experiment 3: independent temporary files for concurrent saves
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp2_interrupted_save.py \
+    --swift-src "$PWD" \
+    --results-json exp2-interrupted-save.json \
+    --timeout 90
+echo "exit=$?"
+```
+
+A passing patched run ends with `exit=0`. On the original implementation,
+the halfway serialization can corrupt the live file, and no rename occurs at
+the other rendezvous points; those are failed checks, not successful atomicity
+evidence. A hard kill may leave a temporary file; this experiment does not
+require impossible exception cleanup after `SIGKILL`.
+
+### Experiment 3: handled failures preserve the old builder and clean up
 
 | | |
 | --- | --- |
-| Supports | Concurrent saves from two threads use independent temporary files and leave one complete, loadable builder. |
-| Command | `python3 experiments/bug_fix/exp3_concurrent_saves.py` |
-| Expected runtime | Normally seconds; allow up to 30 seconds for thread joins. |
-| Expected output | `Ran 1 test` followed by `OK` once temporary filenames are unique per save. Expected to fail on the inspected PID-only temporary-name implementation. |
+| Supports | Before replacement, handled serialization, explicit-flush, file-sync, and replacement failures preserve the old builder, propagate the injected error, and remove the attempt's temporary file. A failed first save restores an unpersisted ID. |
+| Command | `python3 experiments/exp3_save_failure_cleanup.py --swift-src "$PWD"` |
+| Expected runtime | Normally seconds; 90-second default worker deadline. |
+| Expected output | Five named tests, followed by `Ran 5 tests`, `OK`, and `RESULT: PASS` when the checks pass. These are the expected successful results for the patched implementation. |
 
-Two separate builder instances are given different versions and saved to the
-same destination from threads in one process. A barrier forces both writers
-to reach serialization together. The experiment checks that neither save raises
-an error, their temporary filenames differ, and the final file loads as one of
-the complete intended builder states. It does not require a particular writer
-to win.
+Each failure is injected into the real save method while attempting a changed
+builder version. The checks require the exact injected exception, byte-identical
+old contents, successful reload and partition-device lookups, and no additional
+files left after the attempt. The fifth check fails an initial save and verifies
+that neither a destination nor a temporary file remains and the new ID is reset.
+
+This covers errors handled by the `except Exception` path. It does not require
+rollback after rename has already committed a replacement or cleanup following
+an uncatchable process kill.
+
+#### How to run the experiment
 
 ```bash
-python3 experiments/bug_fix/exp3_concurrent_saves.py
+cd /path/to/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp3_save_failure_cleanup.py --swift-src "$PWD"
+
 echo "exit=$?"
 ```
 
-### Experiment 4: composite-builder save failure safety
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp3_save_failure_cleanup.py \
+    --swift-src "$PWD" \
+    --results-json exp3-save-failure-cleanup.json \
+    --timeout 90
+echo "exit=$?"
+```
+
+A passing patched run ends with `exit=0`. On the original implementation,
+a partial serialization damages the live file and some explicit failure points
+are not executed. Failures therefore need interpretation by test name; the
+runner does not automatically label every failure as file corruption.
+
+### Experiment 4: successful saves follow the durability operation order
 
 | | |
 | --- | --- |
-| Supports | A partial JSON serialization leaves the previous composite-builder metadata byte-identical and loadable. |
-| Command | `python3 experiments/bug_fix/exp4_composite_atomic_save.py` |
-| Expected runtime | Seconds. |
-| Expected output | `Ran 1 test` followed by `OK` once composite saves are atomic. Expected to fail on the inspected direct-overwrite implementation. |
+| Supports | A changed builder is serialized to a same-directory temporary file, explicitly flushed, file-synced, closed, renamed into place, and followed by a sync of its containing directory. The installed state is complete and loadable. |
+| Command | `python3 experiments/exp4_save_durability_order.py --swift-src "$PWD"` |
+| Expected runtime | Normally seconds; 90-second default worker deadline. |
+| Expected output | One named test, the observed operation sequence, `Ran 1 test`, `OK`, and `RESULT: PASS` when the checks pass. These are the expected successful results for the patched implementation. |
 
-The experiment saves valid composite metadata, records its original bytes, then
-replaces JSON serialization with a function that writes half the data and raises
-`OSError`. It checks that the save reports the error, the original bytes remain
-unchanged, and `CompositeRingBuilder.load()` restores the original metadata.
-This checks metadata persistence, not a composed ring's object-placement lookup.
+The experiment observes **real** serialization, flush, file-descriptor sync,
+close, and rename calls. It checks that the live file remains unchanged until
+replacement, that the candidate is complete and closed before rename, and that
+the synced directory descriptor identifies the destination's actual parent.
+After saving, the new version must reload with the intended state and valid
+partition-device lookups, and the temporary filename must no longer exist.
+
+Expected sequence:
+
+```text
+serialize -> flush -> file_fsync -> close -> rename -> directory_fsync
+```
+
+#### How to run the experiment
 
 ```bash
-python3 experiments/bug_fix/exp4_composite_atomic_save.py
+cd /path/to/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp4_save_durability_order.py --swift-src "$PWD"
+
 echo "exit=$?"
 ```
 
-Exit `0` means the checks passed; exit `1` means a test or import failed;
-exit `77` means the script refused to run outside Linux. Missing dependencies
-produce an import error, not a passing result. Failing experiments are evidence
-of an unmet claim, not successful demonstrations of the guarantee.
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/EC528_swift
+source .venv/bin/activate
+python3 experiments/exp4_save_durability_order.py \
+    --swift-src "$PWD" \
+    --results-json exp4-save-durability-order.json \
+    --timeout 90
+echo "exit=$?"
+```
+
+A passing run ends with `exit=0`. The original direct-overwrite implementation
+should fail because it opens the live file rather than a temporary file and
+does not perform the required sequence. A missing or failed directory sync is
+not accepted as proof of the complete protocol.
 
 ## 5. Claims and limitations
 

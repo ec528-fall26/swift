@@ -94,11 +94,11 @@ All experiments need the cluster running. Once the setup process is completed, e
 
 They also expect the team's files `SwiftLightFiles/Hello.txt`.
 
-### Experiment 1: a write is durable on a quorum of data servers
+### Experiment 1: acknowledged replicas return the uploaded bytes
 
 | | |
 | --- | --- |
-| Supports | The write path in section 1: the client asks the proxy for the key's fan, then walks it until `replicate_count` servers have durably accepted. |
+| Supports | The configured number of distinct servers acknowledge the upload, and each returns the uploaded bytes on an immediate direct read. This does not verify crash or power-loss survival. |
 | Command | `python3 experiments/swift_light/exp1_write_file.py` |
 | Expected runtime | Seconds. |
 | Expected output |`wrote '<key>' to 2/2 replicas` |
@@ -129,7 +129,7 @@ This uploads `SwiftLightFiles/Hello.txt` into the cluster under the path
 
 | | |
 | --- | --- |
-| Supports | The read path in section 1: the client reads from the primary (`fan[0]`) and says so when another server answers instead. |
+| Supports | The client returns bytes identical to the reference and reports its source. Primary failure is not forced, so a normal run does not verify fallback behavior. |
 | Command | `python3 experiments/swift_light/exp2_read_file.py` |
 | Expected runtime | Seconds. |
 | Expected output | `fetched '<key>' (<n> bytes) from <server> (primary)` |
