@@ -99,6 +99,25 @@ AWS project. This can be done by clicking `Connect using SSH` in the LightSail d
 
 ## 4. Running the experiments
 
+### Background information
+
+Our swift repo has two branches `master` and `bugfix`. `master` has the unmodified version of swift, and `bugfix`
+has our fix. All experiments are runnable on both branches, but under `master`, they are expected to **fail**, and 
+under `bugfix`, they are expected to **pass**.  
+We recommend running experiments 1-4 once under `master`, then again under `bugfix` to best visualize the comparison.
+
+Checking out `master`
+
+```bash
+git checkout master
+```
+
+Checking out `bugfix`
+
+```bash
+git checkout bugfix
+```
+
 ### Experiment 0: Running all unit tests
 
 | | |

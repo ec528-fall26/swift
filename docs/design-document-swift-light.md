@@ -177,6 +177,8 @@ a short read or a stale replica fails instead of passing quietly.
 
 ### Claims
 
+*Claims will be completed in Demo3, after we have finished running the benchmark*
+
 ### What we aim to solve in Demo3
 
 - We currently don't have experiments testing the system during network partition and machine failures because we haven't
@@ -191,4 +193,5 @@ listings in a local SQLite database, and the replicator reads those databases to
 repair stale copies. We left this out because it is irrelevant to what we are testing: the
 experiments cover placement, quorum writes, and read fallback, not listing or container
 operations and not background replication.
-- No partition tolerance logic for proxy.
+- The system doesn't have partition tolerance logic for the proxy, so if proxy fails, the whole
+system becomes unavailable.
