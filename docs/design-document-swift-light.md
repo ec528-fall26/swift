@@ -190,4 +190,5 @@ file systems. These are crucial for a system built for testing purposes.
 listings in a local SQLite database, and the replicator reads those databases to find and
 repair stale copies. We left this out because it is irrelevant to what we are testing: the
 experiments cover placement, quorum writes, and read fallback, not listing or container
-operations and not background replication. 
+operations and not background replication.
+- No partition tolerance logic for proxy.
