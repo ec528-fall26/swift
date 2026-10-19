@@ -122,8 +122,102 @@ python3 experiments/exp1_run_partial_dump_test.py
 echo "exit=$?"
 ```
 
+### Experiments 2–4: additional atomic-save claims
+
+These scripts live in the **course repository** under `experiments/bug_fix/`.
+They import the implementation from a separate upstream Swift checkout. On
+Linux, activate that checkout's prepared virtual environment and, from the
+course repository root, set:
+
+```bash
+source /path/to/EC528_swift/.venv/bin/activate
+export PYTHONPATH=/path/to/EC528_swift
+```
+
+### Experiment 2: individual-builder save failure safety
+
+| | |
+| --- | --- |
+| Supports | An interrupted or failed individual-builder save preserves the previous valid builder. Successful saves follow the file-sync, rename, directory-sync order. |
+| Command | `python3 experiments/bug_fix/exp2_atomic_save_failures.py` |
+| Expected runtime | Normally seconds; allow up to 60 seconds for bounded child-process waits. |
+| Expected output | `Ran 4 tests` followed by `OK` when all checks pass. Expected to pass on the inspected `bugfix` implementation; not yet verified on Linux. The process-kill check should fail on `master`. |
+
+The four checks:
+
+1. Kill a child process after it writes half the serialized data. Verify that
+   the original builder is byte-identical and loadable, then verify that another
+   save succeeds despite any temporary file left by the killed process.
+2. Inject a file `fsync` error. Verify that the original survives and the
+   temporary file is removed.
+3. Inject a replacement error. Verify that the original survives and the
+   temporary file is removed.
+4. Record real file operations during a successful save. Verify that file
+   `fsync` completes before rename and directory `fsync` completes afterward.
+
+From the course repository root, after the environment setup above:
+
+```bash
+python3 experiments/bug_fix/exp2_atomic_save_failures.py
+echo "exit=$?"
+```
+
+### Experiment 3: independent temporary files for concurrent saves
+
+| | |
+| --- | --- |
+| Supports | Concurrent saves from two threads use independent temporary files and leave one complete, loadable builder. |
+| Command | `python3 experiments/bug_fix/exp3_concurrent_saves.py` |
+| Expected runtime | Normally seconds; allow up to 30 seconds for thread joins. |
+| Expected output | `Ran 1 test` followed by `OK` once temporary filenames are unique per save. Expected to fail on the inspected PID-only temporary-name implementation. |
+
+Two separate builder instances are given different versions and saved to the
+same destination from threads in one process. A barrier forces both writers
+to reach serialization together. The experiment checks that neither save raises
+an error, their temporary filenames differ, and the final file loads as one of
+the complete intended builder states. It does not require a particular writer
+to win.
+
+```bash
+python3 experiments/bug_fix/exp3_concurrent_saves.py
+echo "exit=$?"
+```
+
+### Experiment 4: composite-builder save failure safety
+
+| | |
+| --- | --- |
+| Supports | A partial JSON serialization leaves the previous composite-builder metadata byte-identical and loadable. |
+| Command | `python3 experiments/bug_fix/exp4_composite_atomic_save.py` |
+| Expected runtime | Seconds. |
+| Expected output | `Ran 1 test` followed by `OK` once composite saves are atomic. Expected to fail on the inspected direct-overwrite implementation. |
+
+The experiment saves valid composite metadata, records its original bytes, then
+replaces JSON serialization with a function that writes half the data and raises
+`OSError`. It checks that the save reports the error, the original bytes remain
+unchanged, and `CompositeRingBuilder.load()` restores the original metadata.
+This checks metadata persistence, not a composed ring's object-placement lookup.
+
+```bash
+python3 experiments/bug_fix/exp4_composite_atomic_save.py
+echo "exit=$?"
+```
+
+Exit `0` means the checks passed; exit `1` means a test or import failed;
+exit `77` means the script refused to run outside Linux. Missing dependencies
+produce an import error, not a passing result. Failing experiments are evidence
+of an unmet claim, not successful demonstrations of the guarantee.
+
 ## 5. Claims and limitations
 
-What your artifact supports, and an honest account of what does not work or was
-not tested. *An honest narrower result scores better than an impressive result we
-cannot reproduce.*
+Experiments 2–4 specify individual-builder failure safety, concurrent-save
+isolation, and composite-metadata failure safety respectively. They do not
+measure performance, simulate actual power loss, or demonstrate an end-to-end
+composite ring-position lookup. Experiment 2 kills a real child process during
+serialization and observes real file/directory sync ordering; that is narrower
+than proving power-loss durability. Experiment 3 covers threads in one process,
+not independent processes or simultaneous membership changes.
+
+Validation status: the new scripts passed syntax checks and refused to run on
+Windows with exit `77`. Their Linux results have not been collected. Expected
+outcomes above are based on source inspection, not measured passing results.
