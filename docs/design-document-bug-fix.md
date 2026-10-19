@@ -52,7 +52,7 @@ The implementation attempts to delete the temporary file when an exception occur
 ### Remaining Limitations
 
 The current patch improves failure safety for individual RingBuilder saves, but it does not establish complete
-concurrent-save isolation. Additionally, the modification does not automatically make composite-builder metadata saves atomic.Experiments 2–4 investigate these remaining concerns. Their expected outcomes should not be treated as verified results until the experiments have been executed in the target environment.
+concurrent-save isolation. Additionally, the modification does not automatically make composite-builder metadata saves atomic.Experiments 2–4 focus on process interruption, exception handling, and durability ordering for individual RingBuilder saves. Concurrent saves and composite-builder persistence remain outside the scope of these experiments. Their expected outcomes should not be treated as verified results until the experiments have been executed in the target environment.
 
 ## 3. Setup
 
