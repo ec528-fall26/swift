@@ -54,7 +54,7 @@ Include the things that did not work.
 
 ```bash
 git clone https://github.com/ec528-fall26/swift.git
-cd swift
+cd <cloned swift repo directory>
 git checkout Demo2_BugFix
 ```
 
@@ -70,6 +70,7 @@ AWS project. This can be done by clicking `Connect using SSH` in the LightSail d
 three data servers, and a write is considered success after 2 write success is received.
 
 ```bash
+cd /home/ubuntu/swift
 python3 src/swift_light/deploy.py up
 python3 src/swift_light/deploy.py status
 ```

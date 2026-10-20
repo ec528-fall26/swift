@@ -95,7 +95,7 @@ The team has a LightSail instance with Ubuntu 24.04 with setup completed.
 It is possible to access the instance `SwiftBugFix` after accepting the email invitation to the team's
 AWS project. This can be done by clicking `Connect using SSH` in the LightSail dashboard.
 
-![LightSail dashboard for the SwiftBugFix instance, showing the "Connect using SSH" button](Pictures/Screenshot%202026-10-15%20090839.png)
+![LightSail dashboard for the SwiftBugFix instance, showing the "Connect using SSH" button](Pictures/lightsail-connect-ssh.png)
 
 ## 4. Running the experiments
 
