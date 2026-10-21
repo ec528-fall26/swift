@@ -43,7 +43,7 @@ Instead of manually deleting the original file and then moving the temporary fil
 ### Temporary Filename Selection
 
 The implementation uses the process ID to construct the temporary filename: `<builder_file>.new.<PID>` This distinguishes temporary files created by different processes in typical cases. However, threads within the same process share the same PID.
-As a result, simultaneous saves to the same destination can collide on the temporary filename. Experiment 3 is designed to expose this limitation. A possible future improvement is to generate a unique temporary filename for each save operation.
+As a result, simultaneous saves to the same destination can collide on the temporary filename. Concurrent saves within the same process remain a limitation and are not tested by the current experiments.. A possible future improvement is to generate a unique temporary filename for each save operation.
 
 ### Error Handling and Cleanup
 
@@ -52,7 +52,7 @@ The implementation attempts to delete the temporary file when an exception occur
 ### Remaining Limitations
 
 The current patch improves failure safety for individual RingBuilder saves, but it does not establish complete
-concurrent-save isolation. Additionally, the modification does not automatically make composite-builder metadata saves atomic.Experiments 2–4 focus on process interruption, exception handling, and durability ordering for individual RingBuilder saves. Concurrent saves and composite-builder persistence remain outside the scope of these experiments. Their expected outcomes should not be treated as verified results until the experiments have been executed in the target environment.
+concurrent-save isolation. Additionally, the modification does not automatically make composite-builder metadata saves atomic.Experiments 2–4 focus on process interruption, exception handling, and durability ordering for individual RingBuilder saves. Concurrent saves and composite-builder persistence remain outside the scope of these experiments.
 
 ## 3. Setup
 
@@ -102,7 +102,7 @@ AWS project. This can be done by clicking `Connect using SSH` in the LightSail d
 ### Background information
 
 Our swift repo has two branches `master` and `bugfix`. `master` has the unmodified version of swift, and `bugfix`
-has our fix. All experiments are runnable on both branches, but under `master`, they are expected to **fail**, and 
+has our fix. Experiments 1-4 are runnable on both branches, but under `master`, they are expected to **fail**, and 
 under `bugfix`, they are expected to **pass**.  
 We recommend running experiments 1-4 once under `master`, then again under `bugfix` to best visualize the comparison.
 
@@ -151,14 +151,7 @@ python3 experiments/exp0_unittests.py \
 echo "exit=$?"
 ```
 
-Record actual failures on each revision rather than assuming a fixed failure
-count. The existing mocked `test_save` needs updating for the atomic save.
-The partial-dump test can also fail its last comparison because loading adds
-replication fields absent from its device fixtures. Compare against a freshly
-loaded good builder, or populate those fields in the existing test, before
-using it as before/after evidence. The experiment 0 runner can also misclassify
-an entirely failing suite as aborted collection. Inspect pytest output and named failures, not only the
-final runner label.
+We compare named failures across revisions and inspect pytest output because the runner’s summary can misclassify some failures.
 
 ### Experiment 1: preservation after partial serialization
 
@@ -167,7 +160,7 @@ final runner label.
 | Supports | An injected partial-pickle failure preserves the previous individual-builder file and leaves it loadable. This does not kill a process or exercise composite metadata or ring-position lookups. |
 | Command | `python3 experiments/exp1_run_partial_dump_test.py --swift-src "$PWD"` |
 | Expected runtime | Normally seconds; the existing runner selects exactly `TestRingBuilder.test_save_partial_dump_does_nothing`. |
-| Expected output | Before the fix: failure on changed bytes. After the fix: should pass once the fixture comparison described above is corrected. A failure alone does not identify its cause. |
+| Expected output | Before the fix: failure on changed bytes. After the fix: should pass. |
 
 ```bash
 cd /path/to/EC528_swift
@@ -332,14 +325,7 @@ not accepted as proof of the complete protocol.
 
 ## 5. Claims and limitations
 
-Experiments 2–4 specify individual-builder failure safety, concurrent-save
-isolation, and composite-metadata failure safety respectively. They do not
-measure performance, simulate actual power loss, or demonstrate an end-to-end
-composite ring-position lookup. Experiment 2 kills a real child process during
-serialization and observes real file/directory sync ordering; that is narrower
-than proving power-loss durability. Experiment 3 covers threads in one process,
-not independent processes or simultaneous membership changes.
+Experiment 2 tests process interruption before and after replacement. Experiment 3 tests handled failures, preservation of the previous builder, and temporary-file cleanup. Experiment 4 checks the durability operation order. These experiments do not test concurrent-save isolation, composite-builder metadata, actual power loss, or performance.
 
 Validation status: the new scripts passed syntax checks and refused to run on
-Windows with exit `77`. Their Linux results have not been collected. Expected
-outcomes above are based on source inspection, not measured passing results.
+Windows with exit `77`. Experiments 1–4 passed on the team’s Ubuntu LightSail instance using the bugfix branch, while they fail when using the master branch. 

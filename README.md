@@ -11,11 +11,22 @@ durable across node failures by replicating objects and rebalancing them when th
 We contribute to that durability path directly: pick a live bug from Swift's tracker, reproduce it
 on a dev cluster, fix it with a failing-then-passing test, and push it through Gerrit review and CI.
 
+
 ## Quick start
 
-```bash
-# clone, build, and run the smallest thing that shows the system working
-```
+Both parts of the project have detailed setup and experiment commands for
+local Linux and the team's prepared LightSail instances:
+
+- **Swift Light — `SwiftLight` instance:** Follow the
+  [Swift Light design document](docs/design-document-swift-light.md)
+  to start the cluster and run the upload and download experiments.
+
+- **RingBuilder bug fix — `SwiftBugFix` instance:** Follow the
+  [bug-fix design document](docs/design-document-bug-fix.md)
+  to prepare the OpenStack Swift checkout and run experiments 0–4.
+
+The bug-fix experiments run against the separate OpenStack Swift checkout;
+they do not require the Swift Light cluster.
 
 ## Repository layout
 
@@ -40,6 +51,6 @@ on the day of that demo. See the
 | Deliverable | Branch | Must contain |
 | --- | --- | --- |
 | Demo 1 | `demo-1` | slides, code, `docs/design-proposal.md` |
-| Demo 2 | `demo-2` | slides, code, `docs/design-document-swift-light.md`, demo video |
+| Demo 2 | `demo-2` | slides, code, `docs/design-document-swift-light.md`|
 | Demo 3 | `demo-3` | slides, code, updated `docs/design-document-swift-light.md`, demo video |
 | Final | `final-demo` | slides, code, artifact documentation, recorded video presentation |

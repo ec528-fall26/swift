@@ -36,10 +36,46 @@ the command fails.
 
 <img src="Pictures/swift-light-write-path.png" width="600">
 
+### Atomic save
+
+Ring metadata, server configuration, and object contents are saved by writing a
+temporary file in the destination directory, flushing and synchronizing its contents,
+then atomically replacing the destination. Readers see the previous complete file or
+the new complete file instead of a partially written replacement. The system also
+attempts to synchronize the containing directory. This applies to each local file;
+it does not make an update atomic across all replicas.
+
 ## 2. Design decisions
 
-The choices that mattered, the alternatives, and why you chose as you did.
-Include the things that did not work.
+### Ring-based placement
+
+We use a consistent-hashing ring to produce an ordered server list from the object's
+key. This keeps placement deterministic without maintaining a separate location record
+for every object. Compared with Swift's partition and device-management logic, our
+ring is simpler so we can focus on placement and replication in a small cluster.
+
+### Direct client-to-server transfers
+
+The proxy returns placement information, and the client transfers object data directly
+with storage servers. Unlike routing object data through the proxy as Swift does,
+this separates the lookup from the data transfer and makes the request path easier to
+follow. The client therefore handles replica attempts and fallback itself.
+
+### Two acknowledged copies
+
+Our default cluster has three storage servers and requires two distinct servers to
+acknowledge a write. Requiring only one copy would provide less redundancy, while
+requiring all three would prevent writes whenever one server is unavailable. The
+client tries substitutes when necessary, but this acknowledgement threshold does not
+provide strong consistency or guarantee that a read returns the newest version.
+
+### Temporary files instead of overwriting in place
+
+We use atomic replacement to avoid exposing partially written files. This carries the
+same principle as the RingBuilder bug fix into Swift Light's metadata and object
+writes. Synchronization adds work to each save; measuring that performance cost is
+planned for Demo3. Directory synchronization is best-effort, so we do not claim
+unconditional power-loss durability.
 
 ## 3. Setup
 
@@ -178,7 +214,16 @@ a short read or a stale replica fails instead of passing quietly.
 
 ### Claims
 
-*Claims will be completed in Demo3, after we have finished running the benchmark*
+Performance claims and broader claims about failure recovery, fallback behavior, and
+crash durability are deferred to Demo3, pending the relevant benchmarks and experiments.
+The current experiments support two narrower functional claims:
+
+- **Acknowledged replicas contain the uploaded bytes:** Experiment 1 checks that the
+  configured number of distinct servers acknowledge the upload and that each returns
+  the original bytes on an immediate direct read. It does not establish crash survival.
+- **Downloads match the original file:** Experiment 2 checks the downloaded file
+  byte-for-byte against the reference and reports which server supplied it. It does
+  not force a primary failure or establish that fallback works during failures.
 
 ### What we aim to solve in Demo3
 
@@ -192,7 +237,7 @@ file systems. These are crucial for a system built for testing purposes.
 - Swift uses SQLite for its metadata: each account and container server keeps the object
 listings in a local SQLite database, and the replicator reads those databases to find and
 repair stale copies. We left this out because it is irrelevant to what we are testing: the
-experiments cover placement, quorum writes, and read fallback, not listing or container
+current experiments cover acknowledged replica contents and normal downloads, not listing or container
 operations and not background replication.
 - The system doesn't have partition tolerance logic for the proxy, so if proxy fails, the whole
 system becomes unavailable.
