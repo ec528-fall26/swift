@@ -60,6 +60,16 @@ half-written ring in place of a good one.  ``load()`` validates what it read
 before handing back a ring, because the file is the one thing here that can be
 corrupt.
 
+Write modes
+-----------
+Every ring write comes in two flavours.  An *atomic* write (the default) is the
+one just described.  A *non-atomic* write flushes the JSON straight to the
+destination file -- opened, truncated, written, ``fsync`` -- with no temp file
+and no rename.  That is one file operation fewer, but an interruption leaves a
+half-written ring where a good one was, which is the failure the atomic write
+exists to prevent.  The mode is chosen when the cluster is deployed
+(``deploy.py up non_atomic``) and passed to ``build()`` / ``rebalance()``.
+
 ``rebalance()`` uses three files, all beside one another:
 
     ring.json            the layout the cluster is serving from right now
@@ -293,6 +303,7 @@ class ConsistentHashingRing:
         node_prefix: str = DEFAULT_NODE_PREFIX,
         nodes: Iterable[str] | None = None,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Build the cluster's ring, once, and flush it to disk.
 
@@ -305,7 +316,8 @@ class ConsistentHashingRing:
 
         Defaults to ``ring.json`` next to this module.  ``nodes`` overrides the
         generated ``<node_prefix>0, <node_prefix>1, ...`` names, which is how a
-        caller pins placement to a known cluster.
+        caller pins placement to a known cluster.  ``atomic=False`` flushes the
+        ring straight to ``path`` instead of through a temp file and a rename.
         """
         ring = cls(
             tot_node_count,
@@ -331,7 +343,7 @@ class ConsistentHashingRing:
             members = tuple(nodes)
         ring._install(members)
 
-        ring.save(target)
+        ring.save(target, atomic=atomic)
         return ring
 
     # -- membership ---------------------------------------------------------
@@ -343,6 +355,7 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Add ``node`` to the cluster and rebalance onto it.
 
@@ -356,10 +369,10 @@ class ConsistentHashingRing:
         cluster exactly as it was.  There is no settled no-op here: a new server
         always owns points, so there is always something to move.
         """
-        members = cls._settled_members(path, data)
+        members = cls._settled_members(path, data, atomic=atomic)
         if node in members:
             raise ValueError(f"{node!r} is already a member of the cluster")
-        return cls.rebalance((*members, node), data=data, path=path)
+        return cls.rebalance((*members, node), data=data, path=path, atomic=atomic)
 
     @classmethod
     def remove_node(
@@ -368,6 +381,7 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Remove ``node`` from the cluster and rebalance off it.
 
@@ -379,11 +393,14 @@ class ConsistentHashingRing:
         ``replicate_count``.  Both are caught while the target is built, which
         is before the first file moves, so the cluster survives the mistake.
         """
-        members = cls._settled_members(path, data)
+        members = cls._settled_members(path, data, atomic=atomic)
         if node not in members:
             raise ValueError(f"{node!r} is not a member of the cluster")
         return cls.rebalance(
-            tuple(name for name in members if name != node), data=data, path=path
+            tuple(name for name in members if name != node),
+            data=data,
+            path=path,
+            atomic=atomic,
         )
 
     # -- rebalancing --------------------------------------------------------
@@ -395,22 +412,31 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Move the cluster to ``nodes``, one vnode point at a time.
 
         Called after a data server joins or leaves.  The target is built and
         flushed first, then taken one step at a time -- insert or drop a single
-        vnode point, move the files that disturbs, commit by renaming.  See the
-        module docstring for the ordering and why it is safe.
+        vnode point, move the files that disturbs, commit.  See the module
+        docstring for the ordering and why it is safe.
 
         Safe to call again after a crash: it resumes from wherever ``ring.json``
         got to, and returns immediately when there is nothing left to move.
         Call it again on reboot even if you are not sure -- a settled cluster
         costs one file check.
 
+        ``atomic`` picks how each step's ring reaches the disk.  Atomic steps
+        write ``ring.json.temp``, move the files, then rename it over
+        ``ring.json``.  Non-atomic steps move the files and then flush the new
+        ring straight to ``ring.json``: no temp file, no commit point, so an
+        interrupted write leaves a truncated ring.
+
         ``data`` supplies ``list_files`` / ``write`` / ``write_handoff``; see
         :class:`DataServer`.
         """
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
         members = tuple(nodes)
         if not isinstance(data, DataServer):
             raise TypeError(
@@ -445,13 +471,20 @@ class ConsistentHashingRing:
                 hash_algorithm=current.hash_algorithm,
                 nodes=members,
                 path=balanced_path,
+                atomic=atomic,
             )
 
         for edit in _plan_steps(current, balanced):
             following = current._after_edit(edit, balanced._nodes)
-            following.save(temp_path)
-            _move_files(current, following, data)
-            _install_prepared(temp_path, live_path)
+            if atomic:
+                following.save(temp_path)
+                _move_files(current, following, data)
+                _install_prepared(temp_path, live_path)
+            else:
+                # No temp file and no rename: the files move first, then the
+                # new layout is flushed over the live ring in place.
+                _move_files(current, following, data)
+                following.save(live_path, atomic=False)
             current = following
 
         if not _is_settled(current, members):
@@ -582,13 +615,28 @@ class ConsistentHashingRing:
         ring.validate(complete=complete)
         return ring
 
-    def save(self, path: str | os.PathLike[str] | None = None) -> Path:
-        """Atomically write the ring to ``path`` and return where it landed.
+    def save(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        atomic: bool = True,
+    ) -> Path:
+        """Write the ring to ``path`` and return where it landed.
 
-        Defaults to ``ring.json`` next to this module.
+        Defaults to ``ring.json`` next to this module.  Atomic by default --
+        temp file, flush, rename, flush the directory -- so a crash never leaves
+        a half-written ring.  ``atomic=False`` opens ``path`` directly, truncates
+        it, writes, and flushes: faster, but an interrupted write leaves the
+        ring half-written.
         """
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
         target = _resolve_path(path)
-        _atomic_write_text(target, json.dumps(self.to_dict(), indent=2) + "\n")
+        text = json.dumps(self.to_dict(), indent=2) + "\n"
+        if atomic:
+            _atomic_write_text(target, text)
+        else:
+            _write_text_direct(target, text)
         return target
 
     @classmethod
@@ -737,6 +785,8 @@ class ConsistentHashingRing:
         cls,
         path: str | os.PathLike[str] | None,
         data: DataServer,
+        *,
+        atomic: bool = True,
     ) -> tuple[str, ...]:
         """Node names of the settled cluster, finishing an interrupted rebalance.
 
@@ -754,7 +804,9 @@ class ConsistentHashingRing:
         balanced_path = _balanced_path(live_path)
         if balanced_path.is_file():
             pending = cls.load(balanced_path)
-            return cls.rebalance(pending._nodes, data=data, path=path)._nodes
+            return cls.rebalance(
+                pending._nodes, data=data, path=path, atomic=atomic
+            )._nodes
         return cls.load(live_path)._nodes
 
     def _after_edit(
@@ -1038,4 +1090,20 @@ def _atomic_write_text(target: Path, text: str) -> None:
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+    _fsync_directory(directory)
+
+
+def _write_text_direct(target: Path, text: str) -> None:
+    """Write ``text`` straight to ``target`` and flush it -- no rename.
+
+    The destination is truncated before the text is written, so an interruption
+    leaves a half-written ring where a complete one was.  That is the trade a
+    non-atomic write makes: no temp file, no directory entry swap, one file.
+    """
+    directory = target.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     _fsync_directory(directory)

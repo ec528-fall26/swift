@@ -7,6 +7,21 @@ target/
 *.pyc
 __pycache__/
 
+# swift_light local cluster state (deploy.py writes these; the ring is a
+# runtime layout, not source -- delete the ignore rules to commit a demo cluster)
+src/swift_light/proxy_server/ring.json
+src/swift_light/proxy_server/ring.json.temp
+src/swift_light/proxy_server/balanced_ring.json
+src/swift_light/data_server/cluster/
+
+# The ring experiment 3 churns (experiments/swift_light/exp3_atomic_overhead.py
+# copies the deployed ring and removes the copy afterwards; a crash can leave
+# one behind)
+src/swift_light/proxy_server/bench_ring.json
+src/swift_light/proxy_server/bench_ring.json.temp
+src/swift_light/proxy_server/balanced_bench_ring.json
+src/swift_light/proxy_server/bench_ring.json.*.tmp
+
 # Environments
 .venv/
 venv/
