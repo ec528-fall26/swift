@@ -131,6 +131,63 @@ All experiments need the cluster running. Once the setup process is completed, e
 
 They also expect the team's files `SwiftLightFiles/Hello.txt`.
 
+### Experiment 0: what atomic mode costs in operation
+
+| | |
+| --- | --- |
+| Supports | Atomic mode writes more per case than non-atomic mode, and the difference is small next to the cost of a request. It measures cost, not crash survival. |
+| Command | `python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic` |
+| Expected runtime | Roughly 20 minutes per mode; `--operations 200` is a smoke test. |
+| Expected output | A per-case table (cases, failures, seconds, ms/case, p50/p95/p99, cases/second), the ring writes and the cost of one, and `every case succeeded`. |
+| Requires | The cluster deployed in the mode `--mode` names; the experiment is run once per mode. |
+
+#### How to run the experiment
+
+```bash
+cd <cloned swift repo directory>
+
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode non_atomic --json non_atomic.json
+echo "exit=$?"
+python3 src/swift_light/deploy.py down
+
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic --json atomic.json
+echo "exit=$?"
+python3 src/swift_light/deploy.py down
+```
+
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode non_atomic --json non_atomic.json
+echo "exit=$?"
+python3 src/swift_light/deploy.py down
+
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic --json atomic.json
+echo "exit=$?"
+python3 src/swift_light/deploy.py down
+```
+
+Runs 10,000 cases against the running cluster: 80% on data (half writing a file,
+half deleting one written earlier) and 20% on the ring (half adding a data
+server, half removing one). A membership change is a rebalance, so it writes the
+ring once per vnode point -- 100 ring writes per add or remove at the default
+vnode count.
+
+This experiment starts and stops its own cluster and needs no input files, unlike
+experiments 1 and 2.
+
+#### Short version
+
+The entire exp0 runs 10000 saves twice: once in atomic mode and once in non-atomic mode. The whole process takes more than
+one hour, so we provide a simplified version of exp0 containing only 200 saves: 100 ring saves and 100 file saves. We
+recommend running this instead to get a sence of the atomic overhead.
+
 ### Experiment 1: acknowledged replicas return the uploaded bytes
 
 | | |
@@ -216,7 +273,9 @@ a short read or a stale replica fails instead of passing quietly.
 
 Performance claims and broader claims about failure recovery, fallback behavior, and
 crash durability are deferred to Demo3, pending the relevant benchmarks and experiments.
-The current experiments support two narrower functional claims:
+Experiment 0 now measures the one performance number the write mode introduces: what
+atomic writes cost while the cluster is running.
+The current experiments support two functional claims and that cost measurement:
 
 - **Acknowledged replicas contain the uploaded bytes:** Experiment 1 checks that the
   configured number of distinct servers acknowledge the upload and that each returns
@@ -224,6 +283,7 @@ The current experiments support two narrower functional claims:
 - **Downloads match the original file:** Experiment 2 checks the downloaded file
   byte-for-byte against the reference and reports which server supplied it. It does
   not force a primary failure or establish that fallback works during failures.
+- **Atomic mode costs a little more per write:**
 
 ### What we aim to solve in Demo3
 
