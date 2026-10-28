@@ -6,7 +6,10 @@ the owner comes back, and the substitute stores it in its own transfer
 directory marked with the owner's address (see
 :mod:`swift_light.data_server.storage`).  A substitute is therefore holding data
 that belongs to somebody else, and an owner may have copies waiting on a
-substitute.  This module closes both gaps when a server boots.
+substitute.  This module closes both gaps when a server boots -- and again when
+it reconnects: a server that stayed up through a partition never rebooted, so
+the proxy asks it to run this reconciliation when its heartbeat probe shows it
+recovering from a failure.
 
 Boot reconciliation runs in two directions:
 
@@ -30,8 +33,10 @@ server reports to (``proxy_address``), whose answer is the ring's membership.
 
 Both directions are best effort.  A peer that is down, or an entry that cannot
 be moved, is recorded in the report and skipped -- reconciliation never raises
-and never stops the server from serving.  It is normally run once, in the
-background, from :meth:`swift_light.data_server.data_HTTP_server.DataHTTPServer.start`.
+and never stops the server from serving.  It runs in the background at boot,
+from :meth:`swift_light.data_server.data_HTTP_server.DataHTTPServer.start`, and
+again whenever that server's ``POST /handoff`` route is called -- which is what
+the proxy does when it sees the server recover.
 
 Usage
 -----
