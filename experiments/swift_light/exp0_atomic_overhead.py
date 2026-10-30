@@ -31,10 +31,11 @@ the live cluster, in a seeded random order:
   so one case is one object write (or delete) reaching ``replicate_count`` data
   servers, not one file.
 * 20% of the cases touch the **ring**: adding a data server, then removing one.
-  Both are rebalances, and a rebalance moves one vnode point at a time -- with
-  the default 100 vnodes, one membership change is 100 ring writes.  So 2,000
-  of these cases write the ring 200,000 times, which is where atomic mode's temp
-  file, rename and directory flush are paid over and over.
+  Both are rebalances, and a rebalance applies its vnode points in batches of
+  ``DEFAULT_FLUSH_EVERY`` (50) -- with the default 100 vnodes, one membership
+  change is three ring writes (the finished target, then one per batch).  So
+  2,000 of these cases write the ring 6,000 times, which is where atomic mode's
+  commit -- a rename plus a directory flush per batch -- is paid.
 
 The ring is benchmarked on a copy, never on the deployed one
 ------------------------------------------------------------
@@ -58,9 +59,9 @@ Run from the repository root, with the cluster already up::
 
 and again with ``--mode atomic`` after redeploying.
 
-The full 10,000 cases take roughly 20 minutes per mode, because the ring cases
-are 100 ring writes each -- ``--operations 200`` is a smoke test, but only the
-full run averages away the run-to-run noise (about 5% here).
+The full 10,000 cases take several minutes per mode, because 2,000 of them are
+membership changes -- ``--operations 200`` is a smoke test, but only the full
+run averages away the run-to-run noise (about 5% here).
 
 ``--mode`` must name the mode the cluster was actually deployed with: it labels
 the run (nothing on the cluster records the mode) and picks the ring write path
@@ -75,7 +76,8 @@ Reading the numbers
 -------------------
 Every case is timed on its own.  A *file write* case is a quorum write, so it
 is ``replicate_count`` disk writes; a *node join* or *node leave* case is one
-rebalance, i.e. ``vnode_count`` ring writes plus the in-memory re-planning.
+rebalance, i.e. one ring write per batch of ``DEFAULT_FLUSH_EVERY`` vnode
+points plus the finished target, plus the in-memory re-planning.
 
 The cases go through the shipped client's own lookup and quorum code, but over
 one reused connection per server (:class:`KeepAliveClient`): opening a new
@@ -652,16 +654,25 @@ def _workload(
                 name: _summary(name, timings[name], failures[name])
                 for name in CATEGORIES
             },
-            "ring_writes": (
-                len(timings[NODE_JOIN]) + len(timings[NODE_LEAVE])
-            )
-            * deployed.vnode_count,
+            "ring_writes": (len(timings[NODE_JOIN]) + len(timings[NODE_LEAVE]))
+            * _ring_writes_per_change(deployed.vnode_count),
             "leftover_objects": leftover,
         }
         return result
     finally:
         if not args.keep_ring:
             _remove_scratch_ring(scratch)
+
+
+def _ring_writes_per_change(vnode_count: int) -> int:
+    """Ring writes one membership change costs.
+
+    A rebalance flushes the finished target once, then flushes the ring once per
+    batch of ``DEFAULT_FLUSH_EVERY`` vnode points -- so 100 vnodes is three
+    writes, not a hundred.
+    """
+    batches = -(-vnode_count // _ring.DEFAULT_FLUSH_EVERY)
+    return batches + 1
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -746,9 +757,9 @@ def print_report(result: dict[str, Any]) -> None:
     )
     print()
     print(
-        f"  {memberships} membership changes x {result['vnode_count']} vnodes "
-        f"= {result['ring_writes']} ring writes "
-        f"({result['ring_file_bytes']} bytes per write)"
+        f"  {memberships} membership changes = {result['ring_writes']} ring "
+        f"writes ({result['ring_file_bytes']} bytes per write, "
+        f"{_ring_writes_per_change(result['vnode_count'])} per change)"
     )
     ring_seconds = (
         result["categories"][NODE_JOIN]["seconds"]

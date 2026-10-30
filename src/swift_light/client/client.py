@@ -36,13 +36,22 @@ anything is sent.
 
 Durability
 ----------
-A write is not sent to one server.  ``push`` and ``delete`` walk the fan in
-order until ``replicate_count`` servers have durably accepted the change -- the
-*quorum* -- so a write still succeeds while a replica is down, because the
-handoff servers later in the fan take its place.  The report says how many
-replicas acknowledged, and the command fails (exit 1) when the quorum is not
-reached.  A delete of a key a server does not hold counts as accepted: the
-object is already gone there, which is the outcome asked for.
+A write is not sent to one server.  ``push`` and ``delete`` send the change to
+the whole *replica set* -- the first ``replicate_count`` servers of the fan --
+**at once**, one thread per copy, and count the ones that durably accepted it.
+That count is the *quorum*: a write costs one round trip, however many copies
+it keeps, instead of one round trip per copy.
+
+A write still succeeds while a replica is down, because a short quorum then
+goes on to the handoff servers later in the fan, in fan order, until the quorum
+is met -- the sloppy quorum.  That second phase is deliberately serial and
+stops the moment the quorum is reached: it is the degraded path, and writing
+more substitutes than the quorum needs would only leave the later handoff
+reconciliation more to undo.
+
+The report says how many replicas acknowledged, and the command fails (exit 1)
+when the quorum is not reached.  A delete of a key a server does not hold counts
+as accepted: the object is already gone there, which is the outcome asked for.
 
 A read is the other way round.  ``pull`` goes to the primary (``fan[0]``) and
 falls back to the next server only when the primary is unreachable or does not
@@ -89,6 +98,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -323,35 +333,94 @@ class Client:
         ok_statuses: tuple[int, ...],
         data: bytes | None = None,
     ) -> dict[str, Any]:
-        """Send ``method`` to the fan until ``replicate_count`` servers accept.
+        """Reach ``replicate_count`` acknowledged servers, replica set first.
 
-        Walks the fan in order and stops the moment the quorum is reached, so a
-        healthy primary plus its secondaries settle it without touching the
-        handoff servers.  A server that cannot be reached is recorded and the
-        walk goes on -- that is what the later servers are for.
+        Two phases.  The replica set -- the first ``replicate_count`` servers of
+        the fan -- is sent ``method`` *at once*, so a write's latency is the
+        slowest copy rather than the sum of the copies.  Only if that leaves the
+        quorum short are the handoff servers walked, in fan order, stopping as
+        soon as the quorum is met.
+
+        A server that cannot be reached is recorded and the walk goes on -- that
+        is what the later servers are for.  ``acknowledged`` and ``failed`` come
+        back in fan order, so a report reads the same however the race finished.
         """
         quorum = lookup["replicate_count"]
-        acknowledged: list[str] = []
-        failed: list[dict[str, str]] = []
-        for server in lookup["servers"]:
-            if len(acknowledged) >= quorum:
+        servers = list(lookup["servers"])
+        outcomes = list(
+            zip(
+                servers[:quorum],
+                self._send_all(servers[:quorum], method, key, data, ok_statuses),
+            )
+        )
+        accepted = sum(1 for _, error in outcomes if error is None)
+        for server in servers[quorum:]:
+            if accepted >= quorum:
                 break
-            try:
-                status, _ = self._send(method, server, key, data=data)
-            except ClientError as exc:
-                failed.append({"server": server, "error": str(exc)})
-                continue
-            if status in ok_statuses:
-                acknowledged.append(server)
-            else:
-                failed.append({"server": server, "error": _reason(status)})
+            error = self._attempt(server, method, key, data, ok_statuses)
+            outcomes.append((server, error))
+            if error is None:
+                accepted += 1
+        acknowledged = [server for server, error in outcomes if error is None]
         return {
             "key": key,
             "quorum": quorum,
             "acknowledged": acknowledged,
-            "failed": failed,
+            "failed": [
+                {"server": server, "error": error}
+                for server, error in outcomes
+                if error is not None
+            ],
             "ok": len(acknowledged) >= quorum,
         }
+
+    def _send_all(
+        self,
+        servers: list[str],
+        method: str,
+        key: str,
+        data: bytes | None,
+        ok_statuses: tuple[int, ...],
+    ) -> list[str | None]:
+        """Send ``method`` to every server at once; the results keep fan order.
+
+        One thread per server: the replica set is the size of ``replicate_count``
+        and the requests share nothing, so the copies overlap instead of queueing
+        behind each other.  A server that never answers still costs its timeout,
+        but every timeout runs alongside the others rather than after them.
+
+        ``None`` means that server accepted the change; anything else is why it
+        did not.  ``pool.map`` yields in submission order, so the caller can zip
+        the results straight back onto ``servers``.
+        """
+        if not servers:
+            return []
+        if len(servers) == 1:
+            return [self._attempt(servers[0], method, key, data, ok_statuses)]
+        with ThreadPoolExecutor(max_workers=len(servers)) as pool:
+            return list(
+                pool.map(
+                    lambda server: self._attempt(
+                        server, method, key, data, ok_statuses
+                    ),
+                    servers,
+                )
+            )
+
+    def _attempt(
+        self,
+        server: str,
+        method: str,
+        key: str,
+        data: bytes | None,
+        ok_statuses: tuple[int, ...],
+    ) -> str | None:
+        """One write to one server: ``None`` if it accepted, else why it did not."""
+        try:
+            status, _ = self._send(method, server, key, data=data)
+        except ClientError as exc:
+            return str(exc)
+        return None if status in ok_statuses else _reason(status)
 
     # -- transport ----------------------------------------------------------
 

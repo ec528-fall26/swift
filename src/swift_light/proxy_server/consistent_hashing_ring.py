@@ -68,41 +68,56 @@ destination file -- opened, truncated, written, ``fsync`` -- with no temp file
 and no rename.  That is one file operation fewer, but an interruption leaves a
 half-written ring where a good one was, which is the failure the atomic write
 exists to prevent.  The mode is chosen when the cluster is deployed
-(``deploy.py up non_atomic``) and passed to ``build()`` / ``rebalance()``.
+(``deploy.py up non_atomic``) and passed to ``build()`` / ``rebalance()``.  The
+one write that is deliberately always non-atomic is ``rebalance()``'s per-batch
+working copy: it is scratch, and the rename that installs it is the commit.
 
 ``rebalance()`` uses three files, all beside one another:
 
     ring.json            the layout the cluster is serving from right now
-    ring.json.temp       the ring after the step currently being taken
+    ring.json.temp       the ring after the batch currently being taken
     balanced_ring.json   the finished target
 
 Rebalancing
 -----------
 ``rebalance()`` is called after a data server joins or leaves.  It does not
 move placement all at once, because every change has to move real files.  The
-finished target is built and flushed first, then taken one vnode point at a
-time.  Each step does four things, and the order is the whole point:
+finished target is built and flushed first, then taken a batch of
+``DEFAULT_FLUSH_EVERY`` (50) vnode points at a time.  Each batch does four
+things, and the order is the whole point:
 
-1. insert or drop *one* vnode point in ``ring.json.temp`` and flush it, so the
-   intention is on disk before any file moves;
+1. insert or drop the batch's vnode points in ``ring.json.temp`` and flush it
+   *once*, so the intention is on disk before any file moves;
 2. move the files whose placement changed -- ``write()`` to the server taking
    them on, ``write_handoff()`` to the one giving them up;
 3. rename ``ring.json.temp`` over ``ring.json`` -- the commit point;
 4. flush the directory, so the rename survives a crash.
 
+Only ``ring.json`` has to be impossible to tear, and step 3 is what installs it,
+so step 1's flush is a plain write to a scratch file: no second temp file and no
+second rename.  A crash while that write is half-done leaves ``ring.json``
+untouched, which is exactly the state a redo resumes from.
+
+A batch costs one ring write, not one per point.  The ring is the whole fan
+table, tens of kilobytes, so flushing it after every single point made a
+membership change 100 ring writes -- and those writes, not the file moves, were
+what the rebalance spent its time on.  At 50 points per flush a 100-point
+membership change costs two; a larger one costs proportionally more.
+
 ``ring.json`` therefore only ever describes a layout whose files have already
 been moved, and it is what a rebooting server loads.  A crash anywhere earlier
-leaves ``ring.json`` untouched, so the interrupted step is simply redone; file
+leaves ``ring.json`` untouched, so the interrupted batch is simply redone; file
 moves are idempotent, so redoing them is safe.
 
 ``balanced_ring.json`` is the crash marker: it exists while a rebalance is in
-flight and is removed once the last step commits.  Its presence is how a reboot
+flight and is removed once the last batch commits.  Its presence is how a reboot
 tells "interrupted" from "settled", and ``rebalance()`` resumes from it.
 
-A step's worth of movement is not only the arc that changed owner.  Inserting a
-point also puts the arriving server into other arcs' fan lists, as a secondary
+A batch's worth of movement is not only the arcs that changed owner.  Inserting
+a point also puts the arriving server into other arcs' fan lists, as a secondary
 for the arcs just after its point, so those replicas have to be settled too --
-otherwise the ring would claim a copy that was never written.
+otherwise the ring would claim a copy that was never written.  Comparing the
+ring before the batch with the ring after it settles exactly those arcs.
 
 Usage
 -----
@@ -170,6 +185,7 @@ __all__ = [
     "RingAlreadyBuiltError",
     "RING_SIZE",
     "DEFAULT_VNODE_COUNT",
+    "DEFAULT_FLUSH_EVERY",
     "DEFAULT_RING_FILENAME",
 ]
 
@@ -178,6 +194,14 @@ RING_SIZE = 2**16
 
 DEFAULT_VNODE_COUNT = 100
 """Default number of virtual nodes each data server contributes."""
+
+DEFAULT_FLUSH_EVERY = 50
+"""Vnode points a rebalance applies between two ring flushes.
+
+The ring is the whole fan table, so writing it costs far more than moving the
+files for one point.  A batch of 50 points per flush turns a 100-point
+membership change into two ring writes instead of a hundred.
+"""
 
 DEFAULT_HASH_ALGORITHM = "sha1"
 DEFAULT_NODE_PREFIX = "node_"
@@ -414,23 +438,27 @@ class ConsistentHashingRing:
         path: str | os.PathLike[str] | None = None,
         atomic: bool = True,
     ) -> "ConsistentHashingRing":
-        """Move the cluster to ``nodes``, one vnode point at a time.
+        """Move the cluster to ``nodes``, a batch of vnode points at a time.
 
         Called after a data server joins or leaves.  The target is built and
-        flushed first, then taken one step at a time -- insert or drop a single
-        vnode point, move the files that disturbs, commit.  See the module
-        docstring for the ordering and why it is safe.
+        flushed first, then taken ``DEFAULT_FLUSH_EVERY`` points at a time --
+        insert or drop the batch's vnode points, move the files that disturbs,
+        commit.  See the module docstring for the ordering and why it is safe,
+        and for why the points are batched rather than flushed one by one.
 
         Safe to call again after a crash: it resumes from wherever ``ring.json``
         got to, and returns immediately when there is nothing left to move.
         Call it again on reboot even if you are not sure -- a settled cluster
         costs one file check.
 
-        ``atomic`` picks how each step's ring reaches the disk.  Atomic steps
+        ``atomic`` picks how each batch's ring reaches the disk.  Atomic batches
         write ``ring.json.temp``, move the files, then rename it over
-        ``ring.json``.  Non-atomic steps move the files and then flush the new
-        ring straight to ``ring.json``: no temp file, no commit point, so an
-        interrupted write leaves a truncated ring.
+        ``ring.json`` -- the rename is the commit point, and it is the only step
+        that has to be atomic, so the temp file itself is written straight to
+        its own scratch file rather than through a second temp-and-rename.
+        Non-atomic batches move the files and then flush the new ring straight
+        to ``ring.json``: no temp file, no commit point, so an interrupted write
+        leaves a truncated ring.
 
         ``data`` supplies ``list_files`` / ``write`` / ``write_handoff``; see
         :class:`DataServer`.
@@ -474,10 +502,10 @@ class ConsistentHashingRing:
                 atomic=atomic,
             )
 
-        for edit in _plan_steps(current, balanced):
-            following = current._after_edit(edit, balanced._nodes)
+        for batch in _batches(_plan_steps(current, balanced), DEFAULT_FLUSH_EVERY):
+            following = current._after_edits(batch, balanced._nodes)
             if atomic:
-                following.save(temp_path)
+                following.save(temp_path, atomic=False)
                 _move_files(current, following, data)
                 _install_prepared(temp_path, live_path)
             else:
@@ -809,23 +837,27 @@ class ConsistentHashingRing:
             )._nodes
         return cls.load(live_path)._nodes
 
-    def _after_edit(
-        self, edit: _Edit, target_order: tuple[str, ...]
+    def _after_edits(
+        self, edits: Iterable[_Edit], target_order: tuple[str, ...]
     ) -> "ConsistentHashingRing":
-        """A copy of this ring with one vnode point inserted or dropped.
+        """A copy of this ring with a batch of vnode points inserted or dropped.
+
+        Taking the whole batch in one go is what lets the rebalance flush the
+        ring once per batch instead of once per point: the fan areas are derived
+        once for the batch, not once per edit.
 
         ``target_order`` is the membership being rebalanced towards; it fixes
-        the order servers are listed in, so the last step lands exactly on the
+        the order servers are listed in, so the last batch lands exactly on the
         target rather than on a permutation of it.
         """
-        kind, slot, node = edit
         points = list(zip(self._slots, self._point_nodes))
-        if kind == "insert":
-            points.append((slot, node))
-        elif kind == "drop":
-            points.remove((slot, node))
-        else:
-            raise ValueError(f"unknown rebalance edit {kind!r}")
+        for kind, slot, node in edits:
+            if kind == "insert":
+                points.append((slot, node))
+            elif kind == "drop":
+                points.remove((slot, node))
+            else:
+                raise ValueError(f"unknown rebalance edit {kind!r}")
         points.sort()
 
         present = {name for _, name in points}
@@ -938,6 +970,16 @@ def _plan_steps(
     ]
 
 
+def _batches(edits: list[_Edit], size: int) -> Iterator[list[_Edit]]:
+    """Cut a rebalance plan into consecutive groups of at most ``size`` edits.
+
+    Each group is applied and then flushed as one, so the ring is written
+    ``ceil(len(edits) / size)`` times instead of once per point.
+    """
+    for start in range(0, len(edits), size):
+        yield edits[start : start + size]
+
+
 def _arc_ranges(bounds: list[int], ring_size: int) -> list[list[tuple[int, int]]]:
     """Half-open slot ranges for the arcs cut by ``bounds``, as pieces.
 
@@ -1015,7 +1057,7 @@ def _resolve_path(path: str | os.PathLike[str] | None) -> Path:
 
 
 def _temp_path(path: Path) -> Path:
-    """The working file for the step in flight."""
+    """The working file for the batch in flight (scratch; never served)."""
     return path.with_name(path.name + ".temp")
 
 

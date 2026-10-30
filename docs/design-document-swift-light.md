@@ -28,13 +28,16 @@ so the caller can distinguish a normal read from one that is still catching up.
 
 ### Write in Swift Light
 
-A write also starts with the same proxy lookup, but then fans out: the client walks the fan in
-order and stops as soon as `replicate_count` servers have durably accepted the change -- the
-quorum. Because the walk keeps going past a failed server, a write still succeeds while a replica
-is down: the handoff servers further down the fan take its place. If the quorum is never reached,
-the command fails.
+A write also starts with the same proxy lookup, but then fans out: the client sends the change to
+the whole replica set at once and counts the servers that durably accepted it.
+If the replica set comes up short because a replica is down, the handoff servers further down the fan are tried
+in order until the quorum is met -- the sloppy quorum -- and a write still succeeds while a
+replica is down. If the quorum is never reached, the command fails.
 
 <img src="Pictures/swift-light-write-path.png" width="600">
+
+### Adding/Removing a node to/from the cluster
+<TODO: Complete>
 
 ### Atomic save
 
@@ -135,11 +138,14 @@ They also expect the team's files `SwiftLightFiles/Hello.txt`.
 
 | | |
 | --- | --- |
-| Supports | Atomic mode writes more per case than non-atomic mode, and the difference is small next to the cost of a request. It measures cost, not crash survival. |
-| Command | `python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic` |
-| Expected runtime | Roughly 20 minutes per mode; `--operations 200` is a smoke test. |
+| Supports | Atomic mode writes more per case than non-atomic mode, and the difference is small that the performance sacrafise is affordable. |
+| Command | `python3 experiments/swift_light/exp0_atomic_overhead.py --mode <MODE?>` |
+| Expected runtime | Roughly 20 minutes |
 | Expected output | A per-case table (cases, failures, seconds, ms/case, p50/p95/p99, cases/second), the ring writes and the cost of one, and `every case succeeded`. |
 | Requires | The cluster deployed in the mode `--mode` names; the experiment is run once per mode. |
+
+**Note: This experiment requires the system to be deployed in specific momdes, so please do not follow the setup instruction
+for this experiment only. Detailed setup instructions are included in the bash command below.**
 
 #### How to run the experiment
 
@@ -175,12 +181,14 @@ python3 src/swift_light/deploy.py down
 
 Runs 10,000 cases against the running cluster: 80% on data (half writing a file,
 half deleting one written earlier) and 20% on the ring (half adding a data
-server, half removing one). A membership change is a rebalance, so it writes the
-ring once per vnode point -- 100 ring writes per add or remove at the default
-vnode count.
+server, half removing one).  
 
-This experiment starts and stops its own cluster and needs no input files, unlike
-experiments 1 and 2.
+For data writes, one case corresponds to one write/remove, but for the ring, 100 cases results in 3 write/remove.
+This is because adding/remomving one machine to the cluster requires 100 ring changes(one per vnode). If the system
+persists to disk after every vnode change, the performance will be unacceptable. The system, instead, stash changes and
+flush 50 vnodes at once. See the *Architecture* section for details.
+
+This experiment starts and stops its own cluster.
 
 #### Short version
 

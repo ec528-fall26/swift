@@ -5,7 +5,7 @@ reports whether the checks passed. Bug-fix commands run in the prepared Swift
 implementation directory on local Linux or LightSail; Swift Light commands run
 from this course project's root. The two groups test different systems: `bug_fix/` checks OpenStack Swift's
 individual ring-builder save behavior; `swift_light/` checks object uploads and
-downloads in Swift Light.
+downloads in Swift Light, and what its atomic write mode costs.
 
 Each experiment must have a matching entry with its claim, command, expected
 runtime, and expected result in the relevant design document:
@@ -236,6 +236,53 @@ python3 src/swift_light/deploy.py up
 The default experiments use `SwiftLightFiles/Hello.txt` and the object path
 `MyTxtFiles/Hello.txt`. Run the upload before the download, using the same account.
 
+### Experiment 0: what atomic writes cost in operation
+
+**Claim tested:** atomic mode's write path costs more per case than non-atomic
+mode's, and the size of that difference is the overhead the design document
+reports.
+
+```bash
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode non_atomic --json non_atomic.json
+python3 src/swift_light/deploy.py down
+
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic --json atomic.json
+python3 src/swift_light/deploy.py down
+```
+
+Deploy the cluster in the mode `--mode` names, run the experiment, then redeploy
+in the other mode and run it again; each run reports one mode. A run executes
+10,000 cases against the live cluster, in a seeded random order: 80% touch data
+(half writing a file, half deleting one written earlier) and 20% touch the ring
+(half adding a data server, half removing one). A membership change is a
+rebalance, so it writes the ring once per vnode point -- 100 ring writes per add
+or remove at the default vnode count. The ring is churned on a private copy, so
+the deployed ring and every object it placed are left alone.
+
+**Runtime:** roughly 20 minutes per mode at the defaults, because the ring cases
+dominate; `--operations 200` is a smoke test rather than a result.
+
+**Short version:** `experiments/swift_light/exp0_atomic_overhead_simplified.py`
+runs the same two write paths with 200 saves instead of 10,000 cases — 50 file
+saves, one node join (100 ring saves), then 50 more file saves — and finishes in
+about two seconds per mode. It takes the same `--mode`, `--json` and `--ring`
+flags and prints the same table, but with a single membership change it reports
+one sample of the ring write path rather than an average. Use it to check that
+the overhead exists; use the full script for numbers to quote.
+
+**Expected result:** a table of cases, failures, seconds, ms/case,
+p50/p95/p99 and cases/second; the ring writes and the cost of one; and
+`every case succeeded`, with exit `0`. Atomic mode should read slower in every
+row. For scale, one 200-case pair on the development machine put atomic about
+10% above non-atomic per file write, 35% per delete, and 15-23% per membership
+change -- a smoke-test comparison, not a result to quote.
+
+Experiment 0 needs no input files and starts and stops its own cluster;
+experiments 1 and 2 below use `SwiftLightFiles/Hello.txt` and the object path
+`MyTxtFiles/Hello.txt`, uploading before downloading, under the same account.
+
 ### Experiment 1: upload and verify replicas
 
 **Claim tested:** the configured number of distinct servers acknowledge an
@@ -270,7 +317,7 @@ It fails if no node supplies the object or the contents differ.
 contents, with exit `0`. A fallback is reported if it occurs, but primary
 failure is not forced by this experiment.
 
-These two experiments validate immediate upload/download behavior, not
-ring-builder atomicity, power-loss durability, or performance overhead. Their
-exit codes are `0` for success, `1` for an observed operation failure, and `77`
-when the experiment cannot be attempted.
+Experiments 0-2 validate the cost of the write mode and immediate
+upload/download behavior; they do not test ring-builder atomicity, power-loss
+durability, or failure handling. Their exit codes are `0` for success, `1` for
+an observed operation failure, and `77` when the experiment cannot be attempted.
