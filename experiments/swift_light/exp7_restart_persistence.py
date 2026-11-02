@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
-"""Exp7: ring, configuration, and object persistence in a fresh process.
+"""exp7 -- persistence across a fresh process.
 
-Local Linux / SwiftLight LightSail, from the repository root:
+What this checks
+----------------
+Correctness checks for Swift Light, not benchmark measurements. The named tests
+below describe each scenario. We use temporary state and the current checkout's
+implementation; no deployed cluster or Hello.txt file is required.
+
+Prerequisites
+-------------
+Python 3.12, the repository source, and writable temporary storage. Keep
+functional_test_support.py beside this script. No third-party packages needed.
+Use --temp-dir PATH to select an existing writable temporary directory.
+
+
+Usage
+-----
+Run from the repository root::
+
     python3 experiments/swift_light/exp7_restart_persistence.py
 
-Creates temporary state and reopens it in a separate Python process. No running
-cluster needed. Exit 0: passed; 1: failed. This tests reopening completed saves,
-not abrupt process termination, machine failure, or recovery of in-flight saves.
+Exit codes
+----------
+    0   every named check ran and passed
+    1   a check failed, errored, or was skipped
+    77  prerequisite checks failed before the tests could run
 """
 import hashlib
 import json
@@ -65,5 +83,11 @@ print(json.dumps({"config": config.to_dict(), "ring": ring.to_dict(),
             self.assertEqual(json.loads(completed.stdout), expected)
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Run the functional checks and return the experiment exit code."""
+    return run(RestartPersistenceTests, number=7,
+               description="persistence across a fresh process", argv=argv, needs_http=False)
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(RestartPersistenceTests))
+    raise SystemExit(main())

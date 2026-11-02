@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
-"""Exp6: complete-file visibility and pre-replacement failure safety.
+"""exp6 -- atomic-save failure safety and visibility.
 
-Local Linux / SwiftLight LightSail, from the repository root:
+What this checks
+----------------
+Correctness checks for Swift Light, not benchmark measurements. The named tests
+below describe each scenario. We use temporary state and the current checkout's
+implementation; no deployed cluster or Hello.txt file is required.
+
+Prerequisites
+-------------
+Python 3.12, the repository source, and writable temporary storage. Keep
+functional_test_support.py beside this script. No third-party packages needed.
+Use --temp-dir PATH to select an existing writable temporary directory.
+
+
+Usage
+-----
+Run from the repository root::
+
     python3 experiments/swift_light/exp6_atomic_save.py
 
-No deployed cluster needed. Tests real object and ring saving in atomic mode
-using temporary directories and injected failures. Exit 0: passed; 1: failed.
-Directory sync is checked as an attempt, matching the best-effort implementation.
-These checks do not simulate power loss or claim cross-replica atomicity.
+Exit codes
+----------
+    0   every named check ran and passed
+    1   a check failed, errored, or was skipped
+    77  prerequisite checks failed before the tests could run
 """
 import os
 import stat
@@ -176,5 +193,11 @@ class AtomicSaveTests(unittest.TestCase):
                 load()
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Run the functional checks and return the experiment exit code."""
+    return run(AtomicSaveTests, number=6,
+               description="atomic-save failure safety and visibility", argv=argv, needs_http=False)
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(AtomicSaveTests))
+    raise SystemExit(main())

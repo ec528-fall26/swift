@@ -4,8 +4,9 @@ Each numbered script supports a specific claim, prints what it checks, and
 reports whether the checks passed. Bug-fix commands run in the prepared Swift
 implementation directory on local Linux or LightSail; Swift Light commands run
 from this course project's root. The two groups test different systems: `bug_fix/` checks OpenStack Swift's
-individual ring-builder save behavior; `swift_light/` checks object uploads and
-downloads in Swift Light, and what its atomic write mode costs.
+individual ring-builder save behavior; `swift_light/` checks placement,
+replication, read/write fallback, atomic saving, and persistence in Swift Light,
+and separately measures what its atomic write mode costs.
 
 Each experiment must have a matching entry with its claim, command, expected
 runtime, and expected result in the relevant design document:
@@ -227,14 +228,19 @@ reviewed before provisioning a machine.
 
 ## Swift Light experiments
 
-Start the cluster in another terminal:
+For experiments 1 and 2, start the cluster in another terminal:
 
 ```bash
 python3 src/swift_light/deploy.py up
 ```
 
-The default experiments use `SwiftLightFiles/Hello.txt` and the object path
+Experiments 1 and 2 use `SwiftLightFiles/Hello.txt` and the object path
 `MyTxtFiles/Hello.txt`. Run the upload before the download, using the same account.
+
+Experiments 3–7 are independent functional checks, not benchmarks. They create
+their own temporary state and do not require a deployed cluster or experiments
+1 and 2 to have run. Experiments 4 and 5 start isolated storage servers on
+OS-assigned localhost ports, so local connections must be allowed.
 
 ### Experiment 0: what atomic writes cost in operation
 
@@ -321,3 +327,138 @@ Experiments 0-2 validate the cost of the write mode and immediate
 upload/download behavior; they do not test ring-builder atomicity, power-loss
 durability, or failure handling. Their exit codes are `0` for success, `1` for
 an observed operation failure, and `77` when the experiment cannot be attempted.
+
+### Functional experiment prerequisites (3–7)
+
+Run these from the repository root with Python 3.12. No deployed cluster,
+input file, or previous experiment is required. Each script creates temporary state;
+experiments 4 and 5 also start isolated HTTP storage servers on OS-assigned
+localhost ports. Local connections must be allowed. These checks do not modify
+the deployed ring or object stores.
+
+Keep `functional_test_support.py` beside the scripts. Only the Python standard
+library is required. Each script checks temporary-storage access before testing;
+experiments 4 and 5 also check localhost connectivity. Use `--temp-dir PATH`
+with an existing writable directory if the default temporary directory is
+unavailable. This directory only holds disposable test state.
+
+### Experiment 3: ring placement and persistence
+
+**Claim tested:** a key maps to the correct ordered list of distinct servers, and placement stays the same after saving and loading the ring.
+
+```bash
+python3 experiments/swift_light/exp3_ring_placement.py
+```
+
+We check fixed keys against independently calculated hash slots and a reference
+walk of the vnode points. An explicit small ring checks positions on boundaries,
+between boundaries, and across wraparound. We also compare a loaded ring and an
+independently built equivalent ring. This checks deterministic placement, not
+load balance or membership changes.
+
+
+**Runtime:** normally seconds. **Expected result:** 3 named tests,
+`Ran 3 tests`, `OK`, `[exp3] OK`, and `RESULT: PASS`, with exit `0`.
+Subcases are included within the named tests.
+
+### Experiment 4: write acknowledgements and substitute fallback
+
+**Claim tested:** a write succeeds only after the required acknowledgements, using substitutes when intended replicas fail.
+
+```bash
+python3 experiments/swift_light/exp4_write_fallback.py
+```
+
+We use `[B, C, A]` with two required acknowledgements. Controlled transport
+responses cover healthy replicas, connection and HTTP failures, insufficient
+acknowledgements, and total failure. We check the reported servers and payload
+bytes and confirm that A is not contacted when B and C accept. A thread
+rendezvous checks concurrent replica requests without a latency threshold.
+
+An isolated HTTP check uses the real storage handlers and verifies that a
+second replica and substitute store the bytes when the first replica is made
+unreachable. Placement lookup is controlled. This does not establish automatic
+handoff recovery or strong consistency. Correctly rejected uploads count as
+passing checks when rejection is the expected result.
+
+
+**Runtime:** normally seconds. **Expected result:** 3 named tests,
+`Ran 3 tests`, `OK`, `[exp4] OK`, and `RESULT: PASS`, with exit `0`.
+Subcases are included within the named tests.
+
+### Experiment 5: read order and fallback
+
+**Claim tested:** reads try servers in placement order and return the first successful copy, or report failure when no copy is available.
+
+```bash
+python3 experiments/swift_light/exp5_read_fallback.py
+```
+
+We check primary reads, an unreachable primary, missing copies, substitute
+fallback, and cases where every server is missing the object or unreachable.
+We verify attempt order, returned bytes, source and role, and preservation of
+an existing download destination when no server succeeds. Real HTTP checks
+retrieve objects from a secondary and substitute after earlier servers return
+`404`. Placement lookup is controlled.
+
+A different-version case confirms the current first-successful-copy behavior;
+it does not claim newest-version selection, read repair, or strong consistency.
+
+
+**Runtime:** normally seconds. **Expected result:** 3 named tests,
+`Ran 3 tests`, `OK`, `[exp5] OK`, and `RESULT: PASS`, with exit `0`.
+Subcases are included within the named tests.
+
+### Experiment 6: atomic-save failure safety and visibility
+
+**Claim tested:** in atomic mode, handled failures before replacement preserve the previous file, and replacement publishes complete new contents.
+
+```bash
+python3 experiments/swift_light/exp6_atomic_save.py
+```
+
+We test both object files and ring metadata. We inject partial-write, flush,
+file-sync, and replacement errors, then check the exact propagated error, old
+bytes and loadability, temporary-file cleanup, and a successful retry.
+
+For successful saves, we observe real I/O and check write, flush, file sync,
+close, replacement, then a directory-sync attempt. The candidate must be
+complete, closed, and in the destination directory. A paused writer lets a
+reader verify the old contents before replacement and the new contents after.
+On POSIX, the ordering check also requires an observed directory `fsync`.
+
+This tests Swift Light local files, not OpenStack Swift RingBuilder. It does
+not simulate abrupt process termination, power loss, or cross-replica atomicity.
+
+
+**Runtime:** normally seconds. **Expected result:** 3 named tests,
+`Ran 3 tests`, `OK`, `[exp6] OK`, and `RESULT: PASS`, with exit `0`.
+Subcases are included within the named tests.
+
+### Experiment 7: persistence across a fresh process
+
+**Claim tested:** a fresh Python process can reopen completed ring, configuration, and object saves without changing their contents or placement.
+
+```bash
+python3 experiments/swift_light/exp7_restart_persistence.py
+```
+
+We save a ring, configuration, and empty, text, and binary objects, including
+a text overwrite. A separate process receives only paths and keys, reloads
+the files, and reports configuration, ring state, placement, object sizes,
+and SHA-256 hashes for comparison.
+
+This checks persisted state rather than retained memory. It reopens completed
+saves; it does not restart the deployed cluster or simulate an interrupted
+save or machine crash. The child has a 20-second deadline.
+
+
+**Runtime:** normally seconds. **Expected result:** 1 named test,
+`Ran 1 test`, `OK`, `[exp7] OK`, and `RESULT: PASS`, with exit `0`.
+Subcases are included within the named tests.
+
+For experiments 3–7, exit `0` means every check ran and passed, `1` means a
+check failed, errored, or was skipped, and `77` means prerequisite checks failed
+before testing. Failures during the tests remain failures; inspect the named
+check and traceback. Their elapsed times are test runtimes, not benchmark
+measurements. Each script also supports `--help`.

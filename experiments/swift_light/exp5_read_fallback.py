@@ -1,11 +1,32 @@
 #!/usr/bin/env python3
-"""Exp5: read order, replica/substitute fallback, and missing-object behavior.
+"""exp5 -- read order and fallback.
 
-Local Linux / SwiftLight LightSail, from the repository root:
+What this checks
+----------------
+Correctness checks for Swift Light, not benchmark measurements. The named tests
+below describe each scenario. We use temporary state and the current checkout's
+implementation; no deployed cluster or Hello.txt file is required.
+This experiment starts isolated HTTP storage servers on OS-assigned localhost
+ports. It does not stop or modify the deployed cluster.
+
+Prerequisites
+-------------
+Python 3.12, the repository source, and writable temporary storage. Keep
+functional_test_support.py beside this script. No third-party packages needed.
+Use --temp-dir PATH to select an existing writable temporary directory.
+
+
+Usage
+-----
+Run from the repository root::
+
     python3 experiments/swift_light/exp5_read_fallback.py
 
-Uses temporary files and isolated loopback servers; do not start deploy.py.
-Exit 0: passed; 1: failed. First successful copy is the rule, not newest copy.
+Exit codes
+----------
+    0   every named check ran and passed
+    1   a check failed, errored, or was skipped
+    77  prerequisite checks failed before the tests could run
 """
 import tempfile
 import unittest
@@ -76,5 +97,11 @@ class ReadFallbackTests(unittest.TestCase):
                     servers[index].store.delete(key)
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Run the functional checks and return the experiment exit code."""
+    return run(ReadFallbackTests, number=5,
+               description="read order and fallback", argv=argv, needs_http=True)
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(ReadFallbackTests))
+    raise SystemExit(main())

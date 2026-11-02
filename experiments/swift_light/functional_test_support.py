@@ -5,6 +5,8 @@ start deploy.py, use its fixed ports, or change a running cluster's data.
 """
 from __future__ import annotations
 
+import argparse
+import socket
 import sys
 import tempfile
 import unittest
@@ -48,9 +50,54 @@ def data_servers(count=3):
                 server.close()
 
 
-def run(test_case):
-    """Named checks, unittest summary, and a process failure on any failed check."""
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_case)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL", flush=True)
-    return 0 if result.wasSuccessful() else 1
+def run(test_case, *, number, description, argv=None, needs_http=False):
+    """Shared CLI and 0/1/77 result convention, matching experiments 1 and 2."""
+    parser = argparse.ArgumentParser(prog=f"exp{number}", description=description)
+    parser.add_argument(
+        "--temp-dir", metavar="PATH",
+        help="existing writable directory for temporary test state (default: OS temporary directory)",
+    )
+    args = parser.parse_args(argv)
+    prefix = f"[exp{number}]"
+    print(f"{prefix} {description}", flush=True)
+    print(f"{prefix} source    {SRC_ROOT}", flush=True)
+    old_tempdir = tempfile.tempdir
+    try:
+        try:
+            selected = Path(args.temp_dir).resolve() if args.temp_dir else Path(tempfile.gettempdir())
+            if not selected.is_dir():
+                raise OSError(f"temporary directory does not exist: {selected}")
+            # Check before running tests so an unavailable environment is not
+            # confused with a failed correctness assertion. mkdtemp alone does
+            # not establish that files inside the directory are writable.
+            with tempfile.TemporaryDirectory(prefix=f"swift-light-exp{number}-check-", dir=selected) as probe:
+                check = Path(probe) / "check"
+                check.write_bytes(b"check")
+                if check.read_bytes() != b"check":
+                    raise OSError("temporary file read-back failed")
+            if needs_http:
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    listener.listen(1)
+                    with socket.create_connection(listener.getsockname(), timeout=2):
+                        connection, _ = listener.accept()
+                        connection.close()
+            tempfile.tempdir = str(selected)
+        except OSError as exc:
+            print(f"{prefix} cannot attempt the experiment: {exc}", file=sys.stderr)
+            print(f"{prefix} use --temp-dir with a writable directory"
+                  + (" and allow localhost connections" if needs_http else ""), file=sys.stderr)
+            return 77
+
+        print(f"{prefix} temporary {selected}", flush=True)
+        print(f"{prefix} no deployed cluster or input file required", flush=True)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_case)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        ok = result.wasSuccessful() and result.testsRun > 0 and not result.skipped
+        print(f"{prefix} {'OK' if ok else 'FAIL'}: {result.testsRun} named checks; "
+              f"{len(result.failures)} failures, {len(result.errors)} errors, "
+              f"{len(result.skipped)} skipped", flush=True)
+        print("RESULT: PASS" if ok else "RESULT: FAIL", flush=True)
+        return 0 if ok else 1
+    finally:
+        tempfile.tempdir = old_tempdir

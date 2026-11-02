@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
-"""Exp3: deterministic ring placement, boundaries, and persisted placement.
+"""exp3 -- ring placement and persistence.
 
-Run on local Linux or the SwiftLight LightSail instance from the repo root:
+What this checks
+----------------
+Correctness checks for Swift Light, not benchmark measurements. The named tests
+below describe each scenario. We use temporary state and the current checkout's
+implementation; no deployed cluster or Hello.txt file is required.
+
+Prerequisites
+-------------
+Python 3.12, the repository source, and writable temporary storage. Keep
+functional_test_support.py beside this script. No third-party packages needed.
+Use --temp-dir PATH to select an existing writable temporary directory.
+
+
+Usage
+-----
+Run from the repository root::
+
     python3 experiments/swift_light/exp3_ring_placement.py
 
-No running cluster is needed. Exit 0 means all named checks passed; 1 means
-a failure. This checks placement correctness, not balance or performance.
+Exit codes
+----------
+    0   every named check ran and passed
+    1   a check failed, errored, or was skipped
+    77  prerequisite checks failed before the tests could run
 """
 import hashlib
 import tempfile
@@ -76,5 +95,11 @@ class RingPlacementTests(unittest.TestCase):
             self.assertEqual(rebuilt.fan(key), self.ring.fan(key))
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Run the functional checks and return the experiment exit code."""
+    return run(RingPlacementTests, number=3,
+               description="ring placement and persistence", argv=argv, needs_http=False)
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(RingPlacementTests))
+    raise SystemExit(main())
