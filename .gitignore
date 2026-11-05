@@ -40,3 +40,4 @@ credentials
 
 #IDE
 /.idea
+.vscode/

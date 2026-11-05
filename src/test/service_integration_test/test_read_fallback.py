@@ -1,39 +1,21 @@
-#!/usr/bin/env python3
-"""exp5 -- read order and fallback.
+"""Read order and fallback checks for Swift Light.
 
-What this checks
-----------------
-Correctness checks for Swift Light, not benchmark measurements. The named tests
-below describe each scenario. We use temporary state and the current checkout's
-implementation; no deployed cluster or Hello.txt file is required.
-This experiment starts isolated HTTP storage servers on OS-assigned localhost
-ports. It does not stop or modify the deployed cluster.
+Reads must try servers in placement order and return the first successful copy,
+or report failure when no copy is available. The tests start isolated HTTP
+storage servers on OS-assigned localhost ports; they do not stop or modify the
+deployed cluster.
 
-Prerequisites
--------------
-Python 3.12, the repository source, and writable temporary storage. Keep
-functional_test_support.py beside this script. No third-party packages needed.
-Use --temp-dir PATH to select an existing writable temporary directory.
-
-
-Usage
------
 Run from the repository root::
 
-    python3 experiments/swift_light/exp5_read_fallback.py
-
-Exit codes
-----------
-    0   every named check ran and passed
-    1   a check failed, errored, or was skipped
-    77  prerequisite checks failed before the tests could run
+    python -m pytest src/test
+    python -m unittest discover -s src/test -t src/test -v
 """
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from functional_test_support import Client, ClientError, data_servers, lookup, run
+from functional_test_support import Client, ClientError, data_servers, lookup
 
 
 class ReadFallbackTests(unittest.TestCase):
@@ -97,11 +79,5 @@ class ReadFallbackTests(unittest.TestCase):
                     servers[index].store.delete(key)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the functional checks and return the experiment exit code."""
-    return run(ReadFallbackTests, number=5,
-               description="read order and fallback", argv=argv, needs_http=True)
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

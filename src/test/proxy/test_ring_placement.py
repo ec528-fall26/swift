@@ -1,30 +1,16 @@
-#!/usr/bin/env python3
-"""exp3 -- ring placement and persistence.
+"""Ring placement and persistence checks for Swift Light.
 
-What this checks
-----------------
-Correctness checks for Swift Light, not benchmark measurements. The named tests
-below describe each scenario. We use temporary state and the current checkout's
-implementation; no deployed cluster or Hello.txt file is required.
+These tests verify that a key maps to the correct ordered list of distinct
+servers, that boundary and wraparound slots follow clockwise order, and that
+placement is unchanged after the ring is saved and reloaded.
 
-Prerequisites
--------------
-Python 3.12, the repository source, and writable temporary storage. Keep
-functional_test_support.py beside this script. No third-party packages needed.
-Use --temp-dir PATH to select an existing writable temporary directory.
+No deployed cluster or input file is required; the tests create their own
+temporary state.
 
-
-Usage
------
 Run from the repository root::
 
-    python3 experiments/swift_light/exp3_ring_placement.py
-
-Exit codes
-----------
-    0   every named check ran and passed
-    1   a check failed, errored, or was skipped
-    77  prerequisite checks failed before the tests could run
+    python -m pytest src/test
+    python -m unittest discover -s src/test -t src/test -v
 """
 import hashlib
 import tempfile
@@ -32,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from functional_test_support import ConsistentHashingRing as Ring, run
+from functional_test_support import ConsistentHashingRing as Ring
 
 
 class RingPlacementTests(unittest.TestCase):
@@ -95,11 +81,5 @@ class RingPlacementTests(unittest.TestCase):
             self.assertEqual(rebuilt.fan(key), self.ring.fan(key))
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the functional checks and return the experiment exit code."""
-    return run(RingPlacementTests, number=3,
-               description="ring placement and persistence", argv=argv, needs_http=False)
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

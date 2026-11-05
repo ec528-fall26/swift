@@ -1,30 +1,16 @@
-#!/usr/bin/env python3
-"""exp7 -- persistence across a fresh process.
+"""Persistence-across-a-fresh-process checks for Swift Light.
 
-What this checks
-----------------
-Correctness checks for Swift Light, not benchmark measurements. The named tests
-below describe each scenario. We use temporary state and the current checkout's
-implementation; no deployed cluster or Hello.txt file is required.
+A fresh Python process must be able to reopen completed ring, configuration,
+and object saves without changing their contents or placement.
 
-Prerequisites
--------------
-Python 3.12, the repository source, and writable temporary storage. Keep
-functional_test_support.py beside this script. No third-party packages needed.
-Use --temp-dir PATH to select an existing writable temporary directory.
+This checks persisted state rather than retained memory. It reopens completed
+saves; it does not restart the deployed cluster or simulate an interrupted save
+or machine crash.
 
-
-Usage
------
 Run from the repository root::
 
-    python3 experiments/swift_light/exp7_restart_persistence.py
-
-Exit codes
-----------
-    0   every named check ran and passed
-    1   a check failed, errored, or was skipped
-    77  prerequisite checks failed before the tests could run
+    python -m pytest src/test
+    python -m unittest discover -s src/test -t src/test -v
 """
 import hashlib
 import json
@@ -34,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from functional_test_support import SRC_ROOT, ConsistentHashingRing as Ring, DataServerConfig, DataStore, run
+from functional_test_support import SRC_ROOT, ConsistentHashingRing as Ring, DataServerConfig, DataStore
 
 
 class RestartPersistenceTests(unittest.TestCase):
@@ -83,11 +69,5 @@ print(json.dumps({"config": config.to_dict(), "ring": ring.to_dict(),
             self.assertEqual(json.loads(completed.stdout), expected)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the functional checks and return the experiment exit code."""
-    return run(RestartPersistenceTests, number=7,
-               description="persistence across a fresh process", argv=argv, needs_http=False)
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

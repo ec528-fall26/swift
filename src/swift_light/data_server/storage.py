@@ -339,6 +339,31 @@ class DataStore:
         _remove_empty_branches(path.parent, self._root)
         return path
 
+    def list_keys(self) -> list[str]:
+        """Every partition key this server actually holds, sorted.
+
+        The inverse of :meth:`path_for`: each stored file's path is turned back
+        into a key by joining its segments with ``-``.  Handoff trees are
+        skipped -- a directory whose name decodes to a full URL holds objects
+        belonging to somebody else, not this server's own -- and so are leftover
+        ``.tmp`` files from an interrupted write.
+
+        A membership change uses this to find the files in the arcs it has to
+        move.  The cost is one walk of the store, so it is a migration-time
+        operation, not something a request path should call.
+        """
+        if not self._root.is_dir():
+            return []
+        keys: list[str] = []
+        for path in self._root.rglob("*"):
+            if not path.is_file() or path.name.endswith(_TEMP_SUFFIX):
+                continue
+            relative = path.relative_to(self._root)
+            if _is_handoff_dirname(relative.parts[0]):
+                continue
+            keys.append("-".join(relative.parts))
+        return sorted(keys)
+
     # -- handoff ------------------------------------------------------------
 
     def handoff_path_for(self, key: str, from_node: str) -> Path:
@@ -468,6 +493,15 @@ def _valid_address(name: str, value: Any) -> str:
             f"{name} must be a full URL like http://10.0.0.5:8080, got {value!r}"
         )
     return address
+
+
+def _is_handoff_dirname(name: str) -> bool:
+    """Whether a store subdirectory names a handoff owner (a full URL)."""
+    try:
+        _valid_address("from_node", unquote(name))
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _handoff_dirname(node: str) -> str:

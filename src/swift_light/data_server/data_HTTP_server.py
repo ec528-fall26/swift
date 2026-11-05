@@ -16,6 +16,17 @@ the port the server persisted as its ``own_address``::
     DELETE /handoff?owner=<url>&key=<k> clear one handoff once it is collected
     POST   /handoff                     reconcile handoffs now
 
+    GET    /keys                        every partition key this server holds
+    POST   /lock                        take the write lock (X-Lock-Token)
+    DELETE /lock                        release the write lock (X-Lock-Token)
+
+While a migration holds the write lock, ``PUT`` and ``DELETE`` requests that do
+not carry the holder's token are refused with ``503``, so the files being copied
+cannot change underneath the copy.  Reads, heartbeats and ``GET /keys`` stay
+available.  The lock is a lease -- it expires after ``DEFAULT_LOCK_SECONDS``, so
+a coordinator that dies mid-migration cannot wedge the node, and re-taking it
+with the same token extends it.
+
 The heartbeat body is exactly
 :func:`~swift_light.data_server.heartbeat.heartbeat_response`::
 
@@ -92,6 +103,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse, urlsplit
@@ -109,10 +121,23 @@ __all__ = [
     "DataHTTPServer",
     "DataHandler",
     "DEFAULT_HOST",
+    "DEFAULT_LOCK_SECONDS",
+    "LOCK_TOKEN_HEADER",
 ]
 
 DEFAULT_HOST = ""
 """Bind address when ``own_address`` names no host: the empty string binds every interface."""
+
+DEFAULT_LOCK_SECONDS = 120.0
+"""How long a migration's write lock lasts before it lapses on its own.
+
+A lease rather than a flag: a coordinator that crashes mid-transfer must not
+leave the node refusing writes forever.  Re-taking the lock with the same token
+extends it, which is what a long migration does.
+"""
+
+LOCK_TOKEN_HEADER = "X-Lock-Token"
+"""Header carrying the token of the migration that holds the write lock."""
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 """Port to bind when ``own_address`` gives none."""
@@ -215,6 +240,22 @@ class _JsonHandler(BaseHTTPRequestHandler):
         values = parse_qs(urlparse(self.path).query).get("owner")
         return values[0] if values else None
 
+    def _lock_token(self) -> str | None:
+        """The migration token this request carries, if any."""
+        value = self.headers.get(LOCK_TOKEN_HEADER)
+        token = value.strip() if value else ""
+        return token or None
+
+    def _blocked_by_lock(self) -> bool:
+        """Whether a migration holding the lock must refuse this write."""
+        holder = self._data_server.lock_holder()
+        if holder is None or holder == self._lock_token():
+            return False
+        self._send_error_json(
+            503, "this data server is locked for a migration; retry later"
+        )
+        return True
+
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json(status, {"error": message})
 
@@ -241,6 +282,10 @@ class DataHandler(_JsonHandler):
         DELETE /handoff?owner=<url>&key=<k> clear one handoff once it is collected
         POST /handoff                    reconcile handoffs now
 
+        GET /keys                        every partition key this server holds
+        POST /lock                        take the write lock (X-Lock-Token)
+        DELETE /lock                      release the write lock (X-Lock-Token)
+
     The heartbeat body is
     :func:`~swift_light.data_server.heartbeat.heartbeat_response`, built from the
     parameters the server loaded at construction.  A read for a key this server
@@ -260,6 +305,8 @@ class DataHandler(_JsonHandler):
             self._send_json(200, heartbeat_response(self._data_server.config))
         elif path == "/files":
             self._read_file()
+        elif path == "/keys":
+            self._list_keys()
         elif path == "/handoff":
             key = self._query_key()
             if key is None:
@@ -276,14 +323,19 @@ class DataHandler(_JsonHandler):
             self._send_not_found()
 
     def do_POST(self) -> None:
-        if self._path() == "/handoff":
+        path = self._path()
+        if path == "/lock":
+            self._acquire_lock()
+        elif path == "/handoff":
             self._reconcile_handoffs()
         else:
             self._send_not_found()
 
     def do_DELETE(self) -> None:
         path = self._path()
-        if path == "/files":
+        if path == "/lock":
+            self._release_lock()
+        elif path == "/files":
             self._delete_file()
         elif path == "/handoff":
             key = self._query_key()
@@ -315,6 +367,8 @@ class DataHandler(_JsonHandler):
 
     def _write_file(self) -> None:
         """Answer ``PUT /files``: store the body under the key."""
+        if self._blocked_by_lock():
+            return
         key = self._query_key()
         if key is None:
             self._send_error_json(400, "missing query parameter 'key'")
@@ -336,6 +390,8 @@ class DataHandler(_JsonHandler):
 
     def _delete_file(self) -> None:
         """Answer ``DELETE /files``: remove the file for the key."""
+        if self._blocked_by_lock():
+            return
         key = self._query_key()
         if key is None:
             self._send_error_json(400, "missing query parameter 'key'")
@@ -350,6 +406,61 @@ class DataHandler(_JsonHandler):
             self._send_error_json(500, str(exc))
         else:
             self._send_no_content()
+
+    # -- migration routes ---------------------------------------------------
+
+    def _list_keys(self) -> None:
+        """Answer ``GET /keys``: every partition key this server holds.
+
+        Handoff entries are not listed -- they belong to another server -- so a
+        migration copying an arc never mistakes one for a local object.
+        """
+        try:
+            keys = self._data_server.store.list_keys()
+        except OSError as exc:
+            self._send_error_json(500, str(exc))
+        else:
+            self._send_json(200, {"keys": keys})
+
+    def _acquire_lock(self) -> None:
+        """Answer ``POST /lock``: hold the write lock for a migration.
+
+        The token names the migration and must come back on every write it
+        makes; re-taking the lock with the same token extends the lease.
+        """
+        token = self._lock_token()
+        if token is None:
+            self._send_error_json(
+                400, f"the {LOCK_TOKEN_HEADER} header is required"
+            )
+            return
+        values = parse_qs(urlparse(self.path).query).get("seconds")
+        seconds = DEFAULT_LOCK_SECONDS
+        if values:
+            try:
+                seconds = float(values[0])
+            except ValueError:
+                seconds = 0.0
+            if seconds <= 0:
+                self._send_error_json(400, "'seconds' must be a positive number")
+                return
+        if not self._data_server.acquire_lock(token, seconds=seconds):
+            self._send_error_json(409, "another migration already holds the lock")
+        else:
+            self._send_json(200, {"locked": True, "seconds": seconds})
+
+    def _release_lock(self) -> None:
+        """Answer ``DELETE /lock``: give the write lock back."""
+        token = self._lock_token()
+        if token is None:
+            self._send_error_json(
+                400, f"the {LOCK_TOKEN_HEADER} header is required"
+            )
+            return
+        if self._data_server.release_lock(token):
+            self._send_no_content()
+        else:
+            self._send_error_json(409, "this token does not hold the lock")
 
     # -- handoff routes -----------------------------------------------------
 
@@ -389,6 +500,8 @@ class DataHandler(_JsonHandler):
 
     def _delete_handoff(self, key: str) -> None:
         """Answer ``DELETE /handoff``: drop an entry once it has been collected."""
+        if self._blocked_by_lock():
+            return
         owner = self._query_owner()
         if owner is None:
             self._send_error_json(400, "missing query parameter 'owner'")
@@ -413,6 +526,8 @@ class DataHandler(_JsonHandler):
         heartbeat.  A run already in flight will collect everything waiting,
         so a second request is acknowledged without starting another.
         """
+        if self._blocked_by_lock():
+            return
         started = self._data_server.request_handoff_reconcile()
         self._send_json(202, {"started": started})
 
@@ -450,6 +565,12 @@ class DataHTTPServer:
     background, so a slow or unreachable peer never delays the listener.
     :meth:`request_handoff_reconcile` runs it again, which is what the proxy
     asks for when a heartbeat shows this server recovering from a failure.
+
+    A migration can hold the write lock (:meth:`acquire_lock`) while it copies
+    files between this server and a peer.  While it does, ``PUT``/``DELETE``
+    from anyone else answer ``503``; the migration's own traffic carries the
+    lock token and is allowed.  The lock is a lease, so a coordinator that dies
+    mid-migration cannot leave the node refusing writes forever.
     """
 
     def __init__(
@@ -476,6 +597,9 @@ class DataHTTPServer:
         self._sync_thread: threading.Thread | None = None
         self._sync_lock = threading.Lock()
         self.handoff_report: dict[str, Any] | None = None
+        self._lock_guard = threading.Lock()
+        self._lock_token: str | None = None
+        self._lock_until = 0.0
 
     # -- address ------------------------------------------------------------
 
@@ -523,6 +647,45 @@ class DataHTTPServer:
         """Stop serving and release the socket."""
         self.shutdown()
         self._server.server_close()
+
+    # -- write lock ---------------------------------------------------------
+
+    def acquire_lock(
+        self, token: str, *, seconds: float = DEFAULT_LOCK_SECONDS
+    ) -> bool:
+        """Hold the write lock for ``token``, or extend it if it already does.
+
+        Returns ``False`` when another, unexpired token holds it.  The lease is
+        measured from now, so a migration that keeps re-taking the lock keeps
+        the node locked, and one that disappears lets the node free itself.
+        """
+        now = time.monotonic()
+        with self._lock_guard:
+            if (
+                self._lock_token is not None
+                and self._lock_token != token
+                and now < self._lock_until
+            ):
+                return False
+            self._lock_token = token
+            self._lock_until = now + seconds
+            return True
+
+    def release_lock(self, token: str) -> bool:
+        """Release the write lock if ``token`` holds it; ``False`` if not."""
+        with self._lock_guard:
+            if self._lock_token != token:
+                return False
+            self._lock_token = None
+            self._lock_until = 0.0
+            return True
+
+    def lock_holder(self) -> str | None:
+        """The token holding the write lock right now, or ``None`` when free."""
+        with self._lock_guard:
+            if self._lock_token is None or time.monotonic() >= self._lock_until:
+                return None
+            return self._lock_token
 
     # -- handoff reconciliation ---------------------------------------------
 

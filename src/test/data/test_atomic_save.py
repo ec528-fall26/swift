@@ -1,30 +1,16 @@
-#!/usr/bin/env python3
-"""exp6 -- atomic-save failure safety and visibility.
+"""Atomic-save failure-safety and visibility checks for Swift Light.
 
-What this checks
-----------------
-Correctness checks for Swift Light, not benchmark measurements. The named tests
-below describe each scenario. We use temporary state and the current checkout's
-implementation; no deployed cluster or Hello.txt file is required.
+In atomic mode, handled failures before replacement must preserve the previous
+file, and replacement must publish complete new contents. Both object files and
+ring metadata are covered.
 
-Prerequisites
--------------
-Python 3.12, the repository source, and writable temporary storage. Keep
-functional_test_support.py beside this script. No third-party packages needed.
-Use --temp-dir PATH to select an existing writable temporary directory.
+This tests Swift Light local files, not OpenStack Swift's RingBuilder. It does
+not simulate abrupt process termination, power loss, or cross-replica atomicity.
 
-
-Usage
------
 Run from the repository root::
 
-    python3 experiments/swift_light/exp6_atomic_save.py
-
-Exit codes
-----------
-    0   every named check ran and passed
-    1   a check failed, errored, or was skipped
-    77  prerequisite checks failed before the tests could run
+    python -m pytest src/test
+    python -m unittest discover -s src/test -t src/test -v
 """
 import os
 import stat
@@ -34,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from functional_test_support import ConsistentHashingRing as Ring, DataStore, run
+from functional_test_support import ConsistentHashingRing as Ring, DataStore
 from swift_light.data_server import storage
 from swift_light.proxy_server import consistent_hashing_ring as ring_module
 
@@ -193,11 +179,5 @@ class AtomicSaveTests(unittest.TestCase):
                 load()
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the functional checks and return the experiment exit code."""
-    return run(AtomicSaveTests, number=6,
-               description="atomic-save failure safety and visibility", argv=argv, needs_http=False)
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

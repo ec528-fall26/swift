@@ -130,9 +130,12 @@ python3 src/swift_light/deploy.py down
 
 ## 4. Running the experiments
 
-All experiments need the cluster running. Once the setup process is completed, experiments can be run in a separate terminal.
+Experiments 1 and 2 need the cluster running. Experiment 0 deploys and stops its own
+cluster in the mode it measures, and experiments 3 and 4 run the test suites on
+temporary state. Once the setup process is completed, all of them can be run in a
+separate terminal.
 
-They also expect the team's files `SwiftLightFiles/Hello.txt`.
+Experiments 1 and 2 also expect the team's files `SwiftLightFiles/Hello.txt`.
 
 ### Experiment 0: what atomic mode costs in operation
 
@@ -275,6 +278,86 @@ This downloads `MyTxtFiles/Hello.txt` into `SwiftLightFiles/Hello_downloaded.txt
 and checks it byte-for-byte against the original `SwiftLightFiles/Hello.txt`, so
 a short read or a stale replica fails instead of passing quietly.
 
+### Experiment 3: the unit test suite passes
+
+| | |
+| --- | --- |
+| Supports | Each component behaves as specified on its own: the client's path-to-key mapping, the ring's layout and placement, the data server's file store and HTTP routes, and the proxy's heartbeat monitor. |
+| Command | `python3 experiments/swift_light/exp3_unit_tests.py` |
+| Expected runtime | Under 10 seconds. |
+| Expected output | `Ran 50 tests`, `OK`, `[exp3] OK`, and `RESULT: PASS`. |
+| Requires | Python 3.12 and a writable temporary directory. No deployed cluster and no `SwiftLightFiles/Hello.txt`. |
+
+#### How to run the experiment
+
+```bash
+cd <cloned swift repo directory>
+
+python3 experiments/swift_light/exp3_unit_tests.py
+echo "exit=$?"
+```
+
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
+python3 experiments/swift_light/exp3_unit_tests.py
+echo "exit=$?"
+```
+
+#### Ring save atomicity tests
+
+| Test case | Description |
+| --- | --- |
+| `data/test_atomic_save.py` :: `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | Makes the ring save fail at each stage (write, flush, fsync, replace). The old ring must stay unchanged and loadable, with no temporary file left and a working retry. |
+| `data/test_atomic_save.py` :: `AtomicSaveTests.test_successful_save_orders_real_io_before_atomic_replacement` | Checks the order of a successful save: write, flush, sync, close, then replace. The old ring survives until the final step. |
+| `data/test_atomic_save.py` :: `AtomicSaveTests.test_readers_see_old_before_replacement_and_new_after` | A reader running during the save sees the old ring before the replace and the new one after, never a half-written file. |
+| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_save_and_load_round_trip_in_both_write_modes` | Atomic and direct saves both reload to the same layout, so the faster mode changes durability, not meaning. |
+| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_build_refuses_to_overwrite_an_existing_ring` | A second build is refused and the existing ring file is left byte-identical, so files are never silently re-placed. |
+| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_from_dict_rejects_an_inconsistent_layout` | A corrupt ring is rejected instead of served. |
+| `data/test_restart_persistence.py` :: `RestartPersistenceTests.test_completed_state_reopens_in_fresh_process` | A completed save reopens in a fresh process with the same ring state and placement. |
+
+Experiments 3 and 4 keep the exit-code convention of the cluster commands: `0`
+every test ran and passed, `1` a test failed, errored, or was skipped, and `77` the
+suite could not be attempted at all (missing tests, an unwritable `--temp-dir`, or
+no localhost connections).
+
+### Experiment 4: the service integration test suite passes
+
+| | |
+| --- | --- |
+| Supports | The services work together end to end: a push reaches a quorum of real replicas, a pull returns the stored bytes and falls back through the fan, and the proxy answers placement and reports health for its live members. |
+| Command | `python3 experiments/swift_light/exp4_integration_tests.py` |
+| Expected runtime | Under 30 seconds. |
+| Expected output | `Ran 20 tests`, `OK`, `[exp4] OK`, and `RESULT: PASS`. |
+| Requires | Python 3.12 and localhost connections. No deployed cluster and no `SwiftLightFiles/Hello.txt`. |
+
+#### How to run the experiment
+
+```bash
+cd <cloned swift repo directory>
+
+python3 experiments/swift_light/exp4_integration_tests.py
+echo "exit=$?"
+```
+
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
+python3 experiments/swift_light/exp4_integration_tests.py
+echo "exit=$?"
+```
+
+#### Ring save atomicity tests
+
+| Test case | Description |
+| --- | --- |
+| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_torn_ring_file_never_reaches_routing` | With a half-written `ring.json` on disk, a live proxy keeps serving the ring it already loaded, so a partial file never changes placement. |
+| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_complete_replacement_ring_is_picked_up_whole` | After an atomic replacement, the next request uses the new ring in one step, never a mix of the old and new layout. |
+
 ## 5. Claims and limitations
 
 ### Claims
@@ -283,7 +366,8 @@ Performance claims and broader claims about failure recovery, fallback behavior,
 crash durability are deferred to Demo3, pending the relevant benchmarks and experiments.
 Experiment 0 now measures the one performance number the write mode introduces: what
 atomic writes cost while the cluster is running.
-The current experiments support two functional claims and that cost measurement:
+The current experiments support two functional claims, that cost measurement, and
+automated coverage of the behaviours the tests encode:
 
 - **Acknowledged replicas contain the uploaded bytes:** Experiment 1 checks that the
   configured number of distinct servers acknowledge the upload and that each returns
@@ -292,13 +376,11 @@ The current experiments support two functional claims and that cost measurement:
   byte-for-byte against the reference and reports which server supplied it. It does
   not force a primary failure or establish that fallback works during failures.
 - **Atomic mode costs a little more per write:**
-
-### What we aim to solve in Demo3
-
-- We currently don't have experiments testing the system during network partition and machine failures because we haven't
-implemented logic simulating these situations such as manually shutting a data server down.
-- Due to the lack of metric tracking logic, it's currently impossible to see what's inside the hashing ring and data server
-file systems. These are crucial for a system built for testing purposes.
+- **The specified behaviours hold under the tests' scenarios:** Experiment 3 runs the
+  unit suites and experiment 4 the service integration suite. A passing run shows
+  placement, quorum writes with substitute fallback, read fallback, atomic-save
+  safety, and persistence behaving as those tests specify. These are checks of the
+  described scenarios, not evidence about the deployed cluster under failure.
 
 ### Limitations
 
@@ -309,3 +391,6 @@ current experiments cover acknowledged replica contents and normal downloads, no
 operations and not background replication.
 - The system doesn't have partition tolerance logic for the proxy, so if proxy fails, the whole
 system becomes unavailable.
+- The system does not distinguish admin from regular clients, so anyone can perform admin operations to the cluster
+(add/remove nodes). This is fine since this system is essentially a test bench, but such logic should not be allowed
+in production.

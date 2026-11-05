@@ -21,6 +21,8 @@ Commands
              Ctrl-C (which stops everything)
     status   ask the running cluster what it is and how healthy it is
     down     stop the cluster a previous ``up`` left running
+    add-node start one more data server and move data onto it
+    remove-node  move a data server's objects off it, then stop it
 
 Usage
 -----
@@ -30,6 +32,8 @@ Run from the repository root::
     python src/swift_light/deploy.py up non_atomic
     python src/swift_light/deploy.py status
     python src/swift_light/deploy.py down
+    python src/swift_light/deploy.py add-node
+    python src/swift_light/deploy.py remove-node node4
 
 Then use the client, which talks to the proxy on ``http://127.0.0.1:8000``::
 
@@ -54,6 +58,33 @@ file truncated.
 The mode belongs to a run, not to the cluster: it is passed to the ring build
 and to every data server this ``up`` starts.  The ring file does not record it,
 so an existing ring can be reused under either mode; only new writes change.
+
+Live membership changes
+-----------------------
+``add-node`` and ``remove-node`` change the membership of a cluster that is
+already running.  Both read the ring, then drive its rebalance through
+:class:`~swift_light.data_server.remote.RemoteDataServer`, which copies objects
+between the live data servers over HTTP.  While an arc is being transferred the
+source and the nodes gaining or losing a copy hold their write locks, so a
+client cannot write to either side of a copy in flight.
+
+``add-node`` writes ``data_server/cluster/<name>/data_server.json``, starts that
+one server, waits for it to answer, and only then adds it to the ring.
+``remove-node`` requires the server to be up -- its objects have to be readable
+-- moves everything off it, and only then stops it.  Both rewrite
+``proxy_server/ring.json``; the proxy notices the new file on its next request
+and routes with it, so no restart is needed.  Objects are moved, not re-placed:
+this is not ``--rebuild``.
+
+A membership change is resumable.  If one is interrupted, running the same
+command again finishes it from ``balanced_ring.json``.  ``--mode`` selects the
+ring write path (see "Write modes") and, for ``add-node``, the store mode of
+the server it starts.
+
+``add-node`` leaves the server it started running after the command returns,
+recorded in ``pids.json``.  ``down`` stops it like any other node; a supervising
+``up`` that is interrupted stops it too, so a cluster never leaves a server
+running with no record of it.
 
 Order of events
 ---------------
@@ -99,6 +130,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -107,6 +139,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # The package is imported by its full path (there is no ``__init__.py``), so
 # the repository's ``src/`` directory must be importable before any
@@ -117,6 +150,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 from swift_light.data_server import storage as _storage  # noqa: E402
 from swift_light.data_server.data_HTTP_server import DataHTTPServer  # noqa: E402
+from swift_light.data_server.remote import RemoteDataServer  # noqa: E402
 from swift_light.data_server.storage import DataServerConfig  # noqa: E402
 from swift_light.proxy_server import (  # noqa: E402
     consistent_hashing_ring as _ring,
@@ -138,8 +172,10 @@ __all__ = [
     "DEFAULT_WRITE_MODE",
     "DeployError",
     "WRITE_MODES",
+    "add_node",
     "down",
     "main",
+    "remove_node",
     "status",
     "up",
 ]
@@ -181,6 +217,20 @@ CLUSTER_ROOT = Path(_storage.__file__).parent / "cluster"
 
 PID_FILE = CLUSTER_ROOT / "pids.json"
 """What ``up`` started, so ``down`` can stop it."""
+
+
+def _configure_logging() -> None:
+    """Show the swift_light modules' INFO lines on the terminal.
+
+    The modules only *log* and install no handler, so without this a
+    membership change or a finished migration would be dropped at Python's
+    default WARNING level.  Called once by :func:`main`; child processes run
+    the same path, so their output lands on the terminal that ran ``up``.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(module)s] %(levelname)s: %(message)s",
+    )
 
 
 class DeployError(RuntimeError):
@@ -262,6 +312,22 @@ def _terminate(procs: list[tuple[str, subprocess.Popen[bytes]]]) -> None:
         except subprocess.TimeoutExpired:
             print(f"[deploy] {name} ignored terminate; killing it", file=sys.stderr)
             proc.kill()
+
+
+def _terminate_extra(procs: list[tuple[str, subprocess.Popen[bytes]]]) -> None:
+    """Stop servers a live ``add-node`` started, which this ``up`` does not own.
+
+    ``up`` supervises only the children it spawned itself; a data server added
+    while it ran is recorded in the pid file instead.  Stopping the cluster has
+    to take that one down too, or it would be left running after the record is
+    removed.
+    """
+    ours = {name for name, _ in procs}
+    for name, pid in _read_pids().items():
+        if name in ours or not _pid_alive(pid):
+            continue
+        print(f"[deploy] stopping {name} (pid {pid})")
+        _kill_pid(pid)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -366,12 +432,34 @@ def _write_node_parameters(addresses: list[str], proxy_address: str) -> list[Pat
     return configs
 
 
-def _write_pids(procs: list[tuple[str, subprocess.Popen[bytes]]]) -> None:
+def _read_pids() -> dict[str, int]:
+    """The processes earlier commands recorded, or an empty map."""
+    if not PID_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(PID_FILE.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    return {str(name): int(pid) for name, pid in data.items()}
+
+
+def _write_pids_map(pids: dict[str, int]) -> None:
     CLUSTER_ROOT.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(
-        json.dumps({name: proc.pid for name, proc in procs}, indent=2) + "\n",
+        json.dumps(pids, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_pids(procs: list[tuple[str, subprocess.Popen[bytes]]]) -> None:
+    _write_pids_map({name: proc.pid for name, proc in procs})
+
+
+def _remember_pid(name: str, pid: int) -> None:
+    """Record one more running process, keeping the ones already known."""
+    pids = _read_pids()
+    pids[name] = pid
+    _write_pids_map(pids)
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +603,7 @@ def up(args: argparse.Namespace) -> int:
         return exc.code
     finally:
         _terminate(procs)
+        _terminate_extra(procs)
         PID_FILE.unlink(missing_ok=True)
 
 
@@ -573,7 +662,7 @@ def down(args: argparse.Namespace) -> int:
     if not PID_FILE.is_file():
         print("[deploy] no cluster is recorded as running")
         return EXIT_OK
-    pids = json.loads(PID_FILE.read_text(encoding="utf-8"))
+    pids = _read_pids()
     # Removed before anything is killed, not after: the supervising 'up' reads
     # this file to tell a deliberate stop from a crash.
     PID_FILE.unlink(missing_ok=True)
@@ -583,6 +672,194 @@ def down(args: argparse.Namespace) -> int:
             _kill_pid(pid)
         else:
             print(f"[deploy] {name} (pid {pid}) was already gone")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# add-node / remove-node
+# ---------------------------------------------------------------------------
+
+
+def _load_live_ring() -> ConsistentHashingRing:
+    """The ring the cluster is serving from."""
+    if not RING_PATH.is_file():
+        raise DeployError(
+            f"there is no ring at {RING_PATH}; run 'up' first", EXIT_ENVIRONMENT
+        )
+    return ConsistentHashingRing.load(RING_PATH, complete=False)
+
+
+def _cluster_host(ring: ConsistentHashingRing) -> str:
+    """The host the cluster already uses, or :data:`DEFAULT_HOST`."""
+    if ring.nodes:
+        host = urlsplit(ring.nodes[0]).hostname
+        if host:
+            return host
+    return DEFAULT_HOST
+
+
+def _next_data_port(ring: ConsistentHashingRing) -> int:
+    """One past the highest data port on the ring."""
+    ports = [
+        port
+        for port in (urlsplit(node).port for node in ring.nodes)
+        if port is not None
+    ]
+    return max(ports) + 1 if ports else DEFAULT_BASE_DATA_PORT
+
+
+def _next_node_name() -> str:
+    """First ``nodeN`` directory name no server is using."""
+    used = (
+        {path.name for path in CLUSTER_ROOT.iterdir() if path.is_dir()}
+        if CLUSTER_ROOT.is_dir()
+        else set()
+    )
+    index = 1
+    while f"node{index}" in used:
+        index += 1
+    return f"node{index}"
+
+
+def _cluster_proxy_address() -> str:
+    """The proxy address the existing nodes report to."""
+    if CLUSTER_ROOT.is_dir():
+        for directory in sorted(CLUSTER_ROOT.iterdir()):
+            config = directory / _storage.DEFAULT_CONFIG_FILENAME
+            if not config.is_file():
+                continue
+            try:
+                return DataServerConfig.load(config).proxy_address
+            except (OSError, ValueError):
+                continue
+    return f"http://{DEFAULT_HOST}:{DEFAULT_DATA_PORT}"
+
+
+def _directory_for_address(address: str) -> Path | None:
+    """The cluster directory whose parameters name ``address``, if any."""
+    if not CLUSTER_ROOT.is_dir():
+        return None
+    for directory in sorted(CLUSTER_ROOT.iterdir()):
+        config = directory / _storage.DEFAULT_CONFIG_FILENAME
+        if not config.is_file():
+            continue
+        try:
+            if DataServerConfig.load(config).own_address == address:
+                return directory
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _resolve_member(ring: ConsistentHashingRing, value: str) -> str:
+    """The ring URL for ``value``, a deploy name or a data server URL."""
+    if value in ring.nodes:
+        return value
+    config = _node_dir(value) / _storage.DEFAULT_CONFIG_FILENAME
+    if config.is_file():
+        try:
+            address = DataServerConfig.load(config).own_address
+        except (OSError, ValueError) as exc:
+            raise DeployError(
+                f"cannot read {config}: {exc}", EXIT_ENVIRONMENT
+            ) from exc
+        if address in ring.nodes:
+            return address
+    raise DeployError(
+        f"{value!r} is not a data server in {RING_PATH}", EXIT_ENVIRONMENT
+    )
+
+
+def add_node(args: argparse.Namespace) -> int:
+    """Start one more data server and move data onto it."""
+    ring = _load_live_ring()
+    name = args.node or _next_node_name()
+    host = args.host or _cluster_host(ring)
+    port = args.port or _next_data_port(ring)
+    url = f"http://{host}:{port}"
+    if url in ring.nodes:
+        raise DeployError(
+            f"{url} is already a member of the cluster", EXIT_ENVIRONMENT
+        )
+
+    directory = _node_dir(name)
+    directory.mkdir(parents=True, exist_ok=True)
+    config = directory / _storage.DEFAULT_CONFIG_FILENAME
+    DataServerConfig(url, _cluster_proxy_address()).save(config)
+
+    proc = _spawn(
+        "_serve-data",
+        "--config",
+        str(config),
+        "--store",
+        str(directory / _storage.DEFAULT_STORE_DIRNAME),
+        "--mode",
+        args.mode,
+    )
+    _remember_pid(name, proc.pid)
+    try:
+        _await_ready(
+            f"the data server {name} at {url}",
+            f"{url}/heartbeat",
+            timeout=args.start_timeout,
+            proc=proc,
+        )
+        ConsistentHashingRing.add_node(
+            url,
+            data=RemoteDataServer(ring),
+            path=RING_PATH,
+            atomic=args.mode == "atomic",
+        )
+    except DeployError:
+        raise
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise DeployError(
+            f"{url} started but could not be added ({exc}); it is still running "
+            f"and recorded in {PID_FILE.name} -- re-run 'add-node' to finish the move",
+            EXIT_FAILURE,
+        ) from exc
+
+    print(f"[deploy] {name} joined: {url}")
+    print("[deploy] the proxy picks the new ring up on its next request")
+    return EXIT_OK
+
+
+def remove_node(args: argparse.Namespace) -> int:
+    """Move a data server's objects off it, then stop it."""
+    ring = _load_live_ring()
+    address = _resolve_member(ring, args.node)
+    try:
+        _http_json(address.rstrip("/") + "/heartbeat")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise DeployError(
+            f"the data server at {address} is not answering ({exc}); it must be "
+            f"running so its objects can be moved off it",
+            EXIT_FAILURE,
+        ) from exc
+
+    try:
+        ConsistentHashingRing.remove_node(
+            address,
+            data=RemoteDataServer(ring),
+            path=RING_PATH,
+            atomic=args.mode == "atomic",
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise DeployError(
+            f"could not remove {address} ({exc}); re-run 'remove-node' to resume",
+            EXIT_FAILURE,
+        ) from exc
+
+    directory = _directory_for_address(address)
+    name = directory.name if directory is not None else args.node
+    pids = _read_pids()
+    pid = pids.pop(name, None)
+    if pid is not None and _pid_alive(pid):
+        print(f"[deploy] stopping {name} (pid {pid})")
+        _kill_pid(pid)
+    _write_pids_map(pids)
+    print(f"[deploy] {address} left the cluster")
+    print("[deploy] the proxy picks the new ring up on its next request")
     return EXIT_OK
 
 
@@ -737,6 +1014,48 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--data-port", type=int, default=DEFAULT_DATA_PORT, metavar="PORT")
 
     commands.add_parser("down", help="stop the cluster a previous 'up' started")
+
+    join = commands.add_parser(
+        "add-node", help="add a data server and move data onto it"
+    )
+    join.add_argument(
+        "--node",
+        metavar="NAME",
+        help="directory name for the new server (default: the next free nodeN)",
+    )
+    join.add_argument(
+        "--port",
+        type=int,
+        metavar="PORT",
+        help=(
+            "port the new data server binds "
+            "(default: one past the highest port on the ring)"
+        ),
+    )
+    join.add_argument(
+        "--host",
+        default=None,
+        metavar="ADDR",
+        help="address the new server binds (default: the cluster's host)",
+    )
+    join.add_argument(
+        "--mode", choices=WRITE_MODES, default=DEFAULT_WRITE_MODE
+    )
+    join.add_argument(
+        "--start-timeout",
+        type=float,
+        default=DEFAULT_START_TIMEOUT,
+        metavar="SECONDS",
+    )
+
+    leave = commands.add_parser(
+        "remove-node",
+        help="move a data server's objects off it, then stop it",
+    )
+    leave.add_argument("node", metavar="NAME_OR_URL")
+    leave.add_argument(
+        "--mode", choices=WRITE_MODES, default=DEFAULT_WRITE_MODE
+    )
     return parser
 
 
@@ -768,6 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
     its code is returned instead so a caller (and a test) always gets a number.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    _configure_logging()
     if argv and argv[0] in ("_serve-data", "_serve-proxy"):
         # A child that cannot bind its port should say which port and stop,
         # not spill a traceback into the terminal that ran 'up'.
@@ -782,7 +1102,13 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else EXIT_ENVIRONMENT
 
-    handlers = {"up": up, "status": status, "down": down}
+    handlers = {
+        "up": up,
+        "status": status,
+        "down": down,
+        "add-node": add_node,
+        "remove-node": remove_node,
+    }
     try:
         return handlers[args.command](args)
     except DeployError as exc:

@@ -119,6 +119,33 @@ for the arcs just after its point, so those replicas have to be settled too --
 otherwise the ring would claim a copy that was never written.  Comparing the
 ring before the batch with the ring after it settles exactly those arcs.
 
+Locking
+-------
+A file being copied must not change underneath the copy.  When the data server
+a rebalance drives offers ``lock(*nodes)``,
+:func:`_move_files` makes each arc's transfer while the source and every node
+gaining or losing a copy hold that node's write lock; a client write to either
+side is refused for the duration.  The HTTP implementation
+(:class:`~swift_light.data_server.remote.RemoteDataServer`) takes the locks in
+a fixed order -- so two coordinators cannot deadlock -- and leases them, so a
+coordinator that dies mid-migration does not leave a node refusing writes.
+
+The lock is optional, not part of the :class:`DataServer` protocol: a ring-only
+test object has nothing to protect, and the rebalance simply does not lock when
+the object offers no ``lock``.
+
+Logging
+-------
+``rebalance()`` logs two things at ``INFO``: the membership change that caused
+it ("data server(s) joined / left the cluster") and, once every batch has
+committed, its completion ("data migration complete", with the vnode points
+applied, the files moved, and the batch count).  A run that resumes an
+interrupted migration says so instead of repeating the membership line, and a
+call that finds the ring already settled logs at ``DEBUG`` only.
+
+This module installs no handler and sets no level: an application decides
+whether to show those lines (``deploy.py`` configures ``INFO`` when it runs).
+
 Usage
 -----
 Build the cluster's ring -- once, during setup::
@@ -172,10 +199,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from bisect import bisect_right
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol, runtime_checkable
 
@@ -218,6 +247,13 @@ _TEMP_SUFFIX = ".tmp"
 _Point = tuple[int, str]
 _Edit = tuple[str, int, str]
 
+_log = logging.getLogger(__name__)
+"""Where membership changes and data-migration progress are reported.
+
+No handler is installed here: a library leaves that to the application
+(``deploy.py`` configures INFO on the root logger when it runs).
+"""
+
 
 class RingAlreadyBuiltError(FileExistsError):
     """Raised when a ring is built where a ring already exists.
@@ -231,9 +267,19 @@ class RingAlreadyBuiltError(FileExistsError):
 @runtime_checkable
 class DataServer(Protocol):
     """The part of a data server that :meth:`ConsistentHashingRing.rebalance`
-    drives.  Not implemented yet -- this is the contract to build against.
+    drives.
 
     Slots are half-open: a file belongs to the arc ``[start_slot, end_slot)``.
+    :class:`~swift_light.data_server.remote.RemoteDataServer` implements this
+    over HTTP against live data servers; a test object can implement it in a
+    few lines.
+
+    A rebalance also looks for an optional ``lock(*nodes)`` context manager.
+    When one is offered, each arc's transfer is made while the source and every
+    node gaining or losing a copy hold that lock, so a client cannot write to
+    either side of the copy.  It is deliberately not part of this protocol: an
+    in-memory test object has nothing to lock, and ``rebalance`` simply does not
+    lock when the object does not offer one.
     """
 
     def list_files(self, node: str, start_slot: int, end_slot: int) -> Iterable[str]:
@@ -488,7 +534,17 @@ class ConsistentHashingRing:
                     f"{balanced_path.name} targets {len(balanced._nodes)} servers, "
                     f"not the {len(members)} asked for; finish or remove it first"
                 )
+            _log.info(
+                "resuming an interrupted data migration towards %d data servers "
+                "(%d vnode points in place so far)",
+                len(members),
+                len(current._slots),
+            )
         elif _is_settled(current, members):
+            _log.debug(
+                "the ring already describes these %d data servers; nothing to migrate",
+                len(members),
+            )
             return current
         else:
             balanced = cls.build(
@@ -501,24 +557,57 @@ class ConsistentHashingRing:
                 path=balanced_path,
                 atomic=atomic,
             )
+            joined = [name for name in members if name not in current._nodes]
+            left = [name for name in current._nodes if name not in members]
+            if joined:
+                _log.info(
+                    "data server(s) joined the cluster: %s (%d -> %d data servers)",
+                    ", ".join(joined),
+                    len(current._nodes),
+                    len(members),
+                )
+            if left:
+                _log.info(
+                    "data server(s) left the cluster: %s (%d -> %d data servers)",
+                    ", ".join(left),
+                    len(current._nodes),
+                    len(members),
+                )
 
+        moved = 0
+        applied = 0
+        batches = 0
         for batch in _batches(_plan_steps(current, balanced), DEFAULT_FLUSH_EVERY):
             following = current._after_edits(batch, balanced._nodes)
             if atomic:
                 following.save(temp_path, atomic=False)
-                _move_files(current, following, data)
+                moved += _move_files(current, following, data)
                 _install_prepared(temp_path, live_path)
             else:
                 # No temp file and no rename: the files move first, then the
                 # new layout is flushed over the live ring in place.
-                _move_files(current, following, data)
+                moved += _move_files(current, following, data)
                 following.save(live_path, atomic=False)
+            applied += len(batch)
+            batches += 1
             current = following
 
         if not _is_settled(current, members):
             raise RuntimeError(
                 f"rebalance stalled with {len(current._slots)} of "
                 f"{len(members) * current.vnode_count} vnode points in place"
+            )
+
+        if applied:
+            _log.info(
+                "data migration complete: %d vnode points applied, %d files moved "
+                "in %d batch(es); cluster now has %d data servers, "
+                "replicate_count=%d",
+                applied,
+                moved,
+                batches,
+                len(current._nodes),
+                current.replicate_count,
             )
 
         if balanced_path.exists():
@@ -1028,19 +1117,30 @@ def _changed_arcs(
 def _move_files(
     before: ConsistentHashingRing, after: ConsistentHashingRing, data: DataServer
 ) -> int:
-    """Move every file whose placement changed, and count them."""
+    """Move every file whose placement changed, and count them.
+
+    When ``data`` offers a ``lock(*nodes)`` context manager (the HTTP adapter
+    does), one arc's transfer holds it for the source and every node gaining or
+    losing a copy.  A client write to either side of the copy is then refused
+    until the arc is done, instead of landing on a file that is being moved.
+    Locking is optional: a ring-only test object has nothing to protect, and
+    ``getattr`` keeps the protocol unchanged for it.
+    """
     moved = 0
+    lock = getattr(data, "lock", None)
     for pieces, old_set, joined, left in _changed_arcs(before, after):
         source = old_set[0]  # the arc's old primary, which held these files
-        for start, end in pieces:
-            if start >= end:
-                continue
-            for key in data.list_files(source, start, end):
-                for node in joined:
-                    data.write(key, node)
-                for node in left:
-                    data.write_handoff(key, node)
-                moved += 1
+        participants = tuple(dict.fromkeys((source, *joined, *left)))
+        with (lock(*participants) if lock is not None else nullcontext()):
+            for start, end in pieces:
+                if start >= end:
+                    continue
+                for key in data.list_files(source, start, end):
+                    for node in joined:
+                        data.write(key, node)
+                    for node in left:
+                        data.write_handoff(key, node)
+                    moved += 1
     return moved
 
 

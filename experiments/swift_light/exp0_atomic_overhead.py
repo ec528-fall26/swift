@@ -79,6 +79,13 @@ is ``replicate_count`` disk writes; a *node join* or *node leave* case is one
 rebalance, i.e. one ring write per batch of ``DEFAULT_FLUSH_EVERY`` vnode
 points plus the finished target, plus the in-memory re-planning.
 
+Each category also reports the spread of its per-case times as a **sample
+standard deviation** (``n - 1``), in milliseconds, beside the mean.  This is
+what tells a real difference between the two modes apart from jitter: a
+same-mode repeat moves a mean by a few percent here, so a gap between the modes
+that is smaller than the deviation is not a result.  A category with fewer than
+two cases has no spread to report and prints a dash.
+
 The cases go through the shipped client's own lookup and quorum code, but over
 one reused connection per server (:class:`KeepAliveClient`): opening a new
 connection per request costs about 11 ms on loopback, and a case is three
@@ -100,6 +107,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import os
 import random
 import shutil
@@ -684,6 +692,22 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
+def _stddev(values: list[float]) -> float | None:
+    """The sample standard deviation of ``values``, or ``None`` below two cases.
+
+    Sample rather than population: the cases are a sample of the workload, not
+    all of it, and ``n - 1`` is the conventional choice for timing data.  One
+    case says nothing about spread, so it reports ``None`` (a dash) instead of
+    the ``ZeroDivisionError`` ``statistics.stdev`` would raise.
+    """
+    count = len(values)
+    if count < 2:
+        return None
+    mean = sum(values) / count
+    variance = sum((value - mean) ** 2 for value in values) / (count - 1)
+    return math.sqrt(variance)
+
+
 def _summary(name: str, timings: list[float], failures: int) -> dict[str, Any]:
     """Counts and timings for one kind of case, in milliseconds."""
     seconds = sum(timings)
@@ -693,6 +717,7 @@ def _summary(name: str, timings: list[float], failures: int) -> dict[str, Any]:
         "failed": failures,
         "seconds": seconds,
         "mean_ms": (seconds / count * 1000.0) if count else None,
+        "stddev_ms": _ms(_stddev(timings)),
         "p50_ms": _ms(_percentile(timings, 0.50)),
         "p95_ms": _ms(_percentile(timings, 0.95)),
         "p99_ms": _ms(_percentile(timings, 0.99)),
@@ -731,7 +756,8 @@ def print_report(result: dict[str, Any]) -> None:
     print()
     header = (
         f"  {'case':<14}{'cases':>8}{'failed':>8}{'seconds':>10}"
-        f"{'ms/case':>10}{'p50':>10}{'p95':>10}{'p99':>10}{'cases/s':>10}"
+        f"{'ms/case':>10}{'std dev':>10}{'p50':>10}{'p95':>10}{'p99':>10}"
+        f"{'cases/s':>10}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -741,6 +767,7 @@ def print_report(result: dict[str, Any]) -> None:
             f"  {name:<14}{entry['cases']:>8}{entry['failed']:>8}"
             f"{_format(entry['seconds'], '.2f')}"
             f"{_format(entry['mean_ms'], '.3f')}"
+            f"{_format(entry['stddev_ms'], '.3f')}"
             f"{_format(entry['p50_ms'], '.3f')}"
             f"{_format(entry['p95_ms'], '.3f')}"
             f"{_format(entry['p99_ms'], '.3f')}"
