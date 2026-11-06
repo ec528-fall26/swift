@@ -30,6 +30,16 @@ name in front::
 
     a/b/file.txt   by user jdoe   ->   key "jdoe-a-b-file.txt"
 
+A ``-`` is the key's separator, so one inside the account or a path segment is
+escaped as ``\\-`` and cannot be confused with a separator::
+
+    home/notes-v2.txt   by user jdoe   ->   key "jdoe-home-notes\\-v2.txt"
+    home/notes/v2.txt   by user jdoe   ->   key "jdoe-home-notes-v2.txt"
+
+Without that, those two objects would share one key and one another's bytes.
+The backslash is free to escape with because it is a path separator, never part
+of a segment.
+
 The account name is the operating system's login name unless ``--user`` names
 another one.  A path this cannot turn into a usable key is refused before
 anything is sent.
@@ -133,7 +143,7 @@ EXIT_ENVIRONMENT = 77
 _PATH_SEPARATORS = ("/", "\\")
 """A remote path may be written with either separator."""
 
-_FORBIDDEN_IN_SEGMENT = ("/", "\\", ":", "\x00")
+_FORBIDDEN_IN_SEGMENT = ("/", "\\", ":", "\x00")    # \x00 is ASCII 0 char
 """Characters the store refuses inside one path segment."""
 
 
@@ -150,10 +160,13 @@ def object_key(path: str, user: str) -> str:
     """Turn a remote object path and account into the cluster's partition key.
 
     ``a/b/file.txt`` for user ``jdoe`` becomes ``jdoe-a-b-file.txt``: the
-    separators turn into ``-`` and the account name goes in front.  The result
-    is checked against the same rules the data server's store applies -- every
-    ``-``-separated segment must be a usable directory name -- so an impossible
-    key is refused here, before anything is sent.
+    separators turn into ``-`` and the account name goes in front.  A ``-`` that
+    is part of a name rather than a separator -- ``home/notes-v2.txt`` -- is
+    written ``\\-``, so it can never read back as a separator and put two
+    different objects on one key.  The result is checked against the same rules
+    the data server's store applies -- every ``-``-separated segment of the key
+    must be a usable directory name -- so an impossible key is refused here,
+    before anything is sent.
 
     Raises :class:`ClientError` for a path or account that cannot become a key.
     """
@@ -162,7 +175,7 @@ def object_key(path: str, user: str) -> str:
     if not isinstance(user, str):
         raise ClientError(f"account name must be text, got {type(user).__name__}")
     account = _account(user)
-    return "-".join([account, *_segments(path)])
+    return "-".join(_escaped(part) for part in [account, *_segments(path)])
 
 
 def _segments(path: str) -> list[str]:
@@ -180,22 +193,34 @@ def _segments(path: str) -> list[str]:
 
 
 def _account(user: str) -> str:
-    """The account name as a key prefix, refusing one that cannot be a path."""
+    """The account name as a key part, refusing one that cannot be a path.
+
+    The whole name is one segment, dashes included: a key keeps a dash inside a
+    segment escaped, so ``john-doe`` becomes ``john\\-doe`` and does not read
+    back as two accounts.
+    """
     account = user.strip()
     if not account:
         raise ClientError("account name must not be blank")
-    for part in account.split("-"):
-        _check_segment(part, user)
+    _check_segment(account, user)
     return account
 
 
+def _escaped(part: str) -> str:
+    """``part`` as it is written in a key: a literal ``-`` becomes ``\\-``."""
+    return part.replace("-", "\\-")
+
+
 def _check_segment(segment: str, source: str) -> None:
-    """Refuse a segment the store could not turn into a directory name."""
-    if (
-        segment in ("", ".", "..")
-        or ":" in segment
-        or "\x00" in segment
-        or any(separator in segment for separator in _PATH_SEPARATORS)
+    """Refuse a segment the store could not turn into a directory name.
+
+    A segment that is empty, ``.`` or ``..`` would move the path somewhere else;
+    one holding any of :data:`_FORBIDDEN_IN_SEGMENT` -- a path separator, a drive
+    colon, a NUL -- is not a single directory name at all.  Either is refused
+    before the key is built.
+    """
+    if segment in ("", ".", "..") or any(
+        forbidden in segment for forbidden in _FORBIDDEN_IN_SEGMENT
     ):
         raise ClientError(f"{source!r} is not a usable object path")
 

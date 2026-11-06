@@ -51,8 +51,19 @@ object's path written with ``-`` between its segments::
 
     JohnDoe-home-documents-hello.txt   ->   store/JohnDoe/home/documents/hello.txt
 
+A ``-`` is the key's separator, so a dash that belongs to a real name is written
+``\\-`` and stays inside its segment::
+
+    jdoe-home-notes\\-v2.txt   ->   store/jdoe/home/notes-v2.txt
+    jdoe-home-notes-v2.txt     ->   store/jdoe/home/notes/v2.txt
+
+Without that, one object's key would read as the other's, and a file name with
+a dash would silently become an extra directory level.  The backslash is free to
+escape with because it is a path separator and is never part of a segment.
+
 A read for a key the store does not hold raises :class:`FileNotFoundError`; a key
-that cannot be a safe path -- empty, ``.``/``..``, a path separator -- raises
+that cannot be a safe path -- empty, ``.``/``..``, a path separator, an escape
+that does not hide a dash -- raises
 :class:`InvalidKeyError`.  Writes go through the same atomic temp-file-and-rename
 step :meth:`DataServerConfig.save` uses, so a crash never leaves a half-written
 file.  A delete is atomic too -- the file is renamed to a throwaway name first --
@@ -116,7 +127,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import quote, unquote, urlsplit
 
 __all__ = [
@@ -250,7 +261,9 @@ class DataStore:
 
     A partition key is the object's path written with ``-`` between its
     segments: ``JohnDoe-home-documents-hello.txt`` names
-    ``JohnDoe/home/documents/hello.txt``.  The key is turned into a path under
+    ``JohnDoe/home/documents/hello.txt``.  A dash that is part of a name rather
+    than a separator is written ``\\-``, so ``jdoe-home-notes\\-v2.txt`` names
+    ``jdoe/home/notes-v2.txt``.  The key is turned into a path under
     :attr:`root` and the bytes are read or written there.
 
     In atomic mode (the default) writes and deletes are crash-safe -- the same
@@ -343,7 +356,9 @@ class DataStore:
         """Every partition key this server actually holds, sorted.
 
         The inverse of :meth:`path_for`: each stored file's path is turned back
-        into a key by joining its segments with ``-``.  Handoff trees are
+        into a key by joining its segments with ``-``, escaping a dash that is
+        part of a name (see :func:`_key_from_parts`) so the key reads back the
+        way it was written.  Handoff trees are
         skipped -- a directory whose name decodes to a full URL holds objects
         belonging to somebody else, not this server's own -- and so are leftover
         ``.tmp`` files from an interrupted write.
@@ -361,7 +376,7 @@ class DataStore:
             relative = path.relative_to(self._root)
             if _is_handoff_dirname(relative.parts[0]):
                 continue
-            keys.append("-".join(relative.parts))
+            keys.append(_key_from_parts(relative.parts))
         return sorted(keys)
 
     # -- handoff ------------------------------------------------------------
@@ -445,14 +460,16 @@ class DataStore:
 
         Walks ``from_node``'s handoff directory and turns each stored path back
         into a key -- the inverse of :meth:`handoff_path_for`.  The round trip is
-        sound because a key's segments can never contain the ``-`` the key is
-        split on.  Leftover ``.tmp`` files from an interrupted write are skipped.
+        sound because a key's segments can never contain an unescaped ``-``: a
+        dash that is part of a name is written ``\\-``, both on the way in and on
+        the way back out.  Leftover ``.tmp`` files from an interrupted write are
+        skipped.
         """
         owner_dir = self._root / _handoff_dirname(from_node)
         if not owner_dir.is_dir():
             return []
         keys = [
-            "-".join(path.relative_to(owner_dir).parts)
+            _key_from_parts(path.relative_to(owner_dir).parts)
             for path in owner_dir.rglob("*")
             if path.is_file() and not path.name.endswith(_TEMP_SUFFIX)
         ]
@@ -526,15 +543,18 @@ def _key_to_relative_path(key: str) -> Path:
     """Turn a ``-``-separated partition key into a relative path.
 
     ``JohnDoe-home-documents-hello.txt`` becomes
-    ``JohnDoe/home/documents/hello.txt``.  Anything that is not a plain
-    sequence of path segments is refused, so a key can never climb out of the
-    store.
+    ``JohnDoe/home/documents/hello.txt``.  A segment that itself contains a dash
+    writes it ``\\-``, so ``jdoe-home-notes\\-v2.txt`` names
+    ``jdoe/home/notes-v2.txt`` while ``jdoe-home-notes-v2.txt`` names
+    ``jdoe/home/notes/v2.txt`` -- the two names stay apart.  Anything that is not
+    a plain sequence of path segments is refused, so a key can never climb out of
+    the store.
     """
     if not isinstance(key, str):
         raise TypeError(f"partition key must be a str, got {type(key).__name__}")
     if not key:
         raise InvalidKeyError("partition key must not be empty")
-    segments = key.split("-")
+    segments = _split_key(key)
     for segment in segments:
         if (
             segment in ("", ".", "..")
@@ -545,6 +565,47 @@ def _key_to_relative_path(key: str) -> Path:
         ):
             raise InvalidKeyError(f"partition key {key!r} is not a usable path")
     return Path(*segments)
+
+
+def _split_key(key: str) -> list[str]:
+    """Cut ``key`` at its unescaped dashes, unescaping ``\\-`` back to ``-``.
+
+    The only thing an escape may hide is a dash, so a key that ends in one, or
+    has one in front of any other character, is refused -- it did not come from
+    a client's ``object_key`` and its segment boundaries would be a guess.
+
+    Raises :class:`InvalidKeyError` for such a key.
+    """
+    segments: list[str] = []
+    segment: list[str] = []
+    index = 0
+    while index < len(key):
+        character = key[index]
+        if character == "\\":
+            index += 1
+            if index == len(key) or key[index] != "-":
+                raise InvalidKeyError(
+                    f"partition key {key!r} has an escape that hides no dash"
+                )
+            segment.append("-")
+        elif character == "-":
+            segments.append("".join(segment))
+            segment = []
+        else:
+            segment.append(character)
+        index += 1
+    segments.append("".join(segment))
+    return segments
+
+
+def _key_from_parts(parts: Iterable[str]) -> str:
+    """The key naming ``parts`` -- the inverse of :func:`_split_key`.
+
+    A dash inside one of the parts is escaped, so a path such as
+    ``jdoe/home/notes-v2.txt`` comes back as ``jdoe-home-notes\\-v2.txt`` and
+    not as five segments.
+    """
+    return "-".join(part.replace("-", "\\-") for part in parts)
 
 
 def _fsync_directory(directory: Path) -> None:

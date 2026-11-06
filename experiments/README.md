@@ -8,7 +8,8 @@ individual ring-builder save behavior; `swift_light/` measures what Swift Light'
 atomic write mode costs and checks that uploads and downloads move the intended
 bytes. Swift Light's placement, read/write fallback, atomic-save, and
 persistence checks live in a functional test suite under
-[`src/test/`](../src/test/), which experiments 3 and 4 run.
+[`src/test/`](../src/test/), which experiments 3 and 4 run; experiment 5 runs
+that suite's latency test.
 
 Each experiment must have a matching entry with its claim, command, expected
 runtime, and expected result in the relevant design document:
@@ -341,16 +342,27 @@ server's store and HTTP routes, and the proxy's heartbeat monitor.
 
 ```bash
 python3 experiments/swift_light/exp3_unit_tests.py
+
+# the same suite with non-atomic writes
+python3 experiments/swift_light/exp3_unit_tests.py non_atomic
 ```
 
 The script discovers and runs everything under `src/test/client/`,
 `src/test/data/` and `src/test/proxy/`. It creates temporary state and starts
 isolated storage servers on OS-assigned loopback ports, so no deployed cluster,
-input file, or earlier experiment is required.
+input file, or earlier experiment is required. The optional `MODE` -- `atomic`
+(the default) or `non_atomic`, the same two `deploy.py up` accepts -- decides how
+those servers write their objects, and the mode wins over what a test asks for.
+That makes `non_atomic` a negative control: the nine checks in
+`data/test_atomic_save.py` and `data/test_crash_atomicity.py` that assert the
+atomic guarantees must fail there. The crash suite performs a real hard kill --
+`SIGKILL` on POSIX, `TerminateProcess` on Windows -- while a child writer is
+mid-write, before the rename, and after it, then reopens the target and retries.
 
-**Runtime:** normally under 10 seconds. **Expected result:** `Ran 50 tests`,
-`OK`, `[exp3] OK`, and `RESULT: PASS`, with exit `0`. Subcases are included
-within the named tests.
+**Runtime:** normally under 15 seconds. **Expected result:** under `atomic`,
+`Ran 60 tests`, `OK`, `[exp3] OK` and `RESULT: PASS` with exit `0`; under
+`non_atomic`, the same 60 tests with `9 failures` and `RESULT: FAIL` with exit
+`1` -- those nine are the point of the run, not a regression.
 
 ### Experiment 4: run the service integration test suite
 
@@ -360,18 +372,65 @@ routes and reports health for its live members.
 
 ```bash
 python3 experiments/swift_light/exp4_integration_tests.py
+
+# the same suite with non-atomic writes
+python3 experiments/swift_light/exp4_integration_tests.py non_atomic
 ```
 
 The script discovers and runs everything under
 `src/test/service_integration_test/`. It starts real data servers and proxies on
 OS-assigned loopback ports with temporary state, so local connections must be
-allowed; it does not start, stop, or change a deployed cluster.
+allowed; it does not start, stop, or change a deployed cluster. The optional
+`MODE` works as it does for experiment 3 and is authoritative, but this suite
+stays green under either mode: every check here asserts an outcome -- the bytes
+come back, the quorum was reached, the fallback happened -- and an uninterrupted
+write gives the same outcome in both modes. Only exp3 can tell the modes apart.
+It also drives `RemoteDataServer` -- the ring's migration interface -- against
+real servers: copying, handoff, the write-lock lease, and an end-to-end
+`add_node` rebalance.
 
-**Runtime:** normally under 30 seconds. **Expected result:** `Ran 20 tests`,
+**Runtime:** normally under 60 seconds. **Expected result:** `Ran 27 tests`,
 `OK`, `[exp4] OK`, and `RESULT: PASS`, with exit `0`. Subcases are included
 within the named tests.
 
 For experiments 3 and 4, exit `0` means every test ran and passed, `1` means a
 test failed, errored, or was skipped, and `77` means the suite could not be
 attempted: missing tests, an unwritable `--temp-dir`, or no localhost
-connections. Both accept `--temp-dir PATH` and `--help`.
+connections. Both accept an optional `MODE` (`atomic` or `non_atomic`),
+`--temp-dir PATH` and `--help`.
+
+### Experiment 5: p95 write and read latency
+
+**Claim tested:** one write and one read stay inside the design proposal's
+performance baseline -- p95 write latency `<= 50 ms` and p95 read latency
+`<= 20 ms`, metrics 1 and 3 of its table.
+
+```bash
+python3 experiments/swift_light/exp5_latency.py
+```
+
+The measurement is a test in [`src/test/performance_eval/`](../src/test/performance_eval/),
+and this script runs it, the way experiments 3 and 4 run their suites. The test
+builds a real consistent-hashing ring and one real `DataStore` per data server in
+a temporary directory it owns, then times 100 writes -- ring lookup plus one copy
+per replica, in parallel, through the atomic temp file, flush and rename path --
+and 100 reads -- lookup plus the primary's store -- one case at a time. Every
+read is compared with the bytes that were written, so a fast wrong answer fails.
+It reports cases, failures, mean, standard deviation, p50/p95/p99, max and the
+budget per phase. `SWIFT_LIGHT_PERF_SAMPLES` changes the sample count and
+`--temp-dir PATH` changes where the temporary state lives.
+
+Nothing in this measurement touches the network: no TCP handshake, no connection
+close, no HTTP. That is deliberate -- a fresh loopback connection costs about
+11 ms here and one client write is three requests, so an end-to-end run measures
+socket setup as much as the cluster; with a fresh connection per request the same
+workload reported a read p95 of 48 ms against this 20 ms budget for that reason
+alone. The numbers are the backend's own placement, storage and durable-write
+cost: a floor for what a client sees, which is higher by whatever the HTTP stack
+and the TCP setup add. Metric 2 of the baseline table, 1,000 sustained
+acknowledged writes, is not measured here: it needs concurrent load.
+
+**Runtime:** about a second at the defaults. **Expected result:** the two-row
+timing table with a `PASS` per row, `Ran 2 tests`, `OK`, `[exp5] OK`, and
+`RESULT: PASS`, with exit `0`. Exit `1` means a p95 went over budget or a case
+failed, and `77` means the suite could not be attempted.

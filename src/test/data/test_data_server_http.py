@@ -12,6 +12,7 @@ Run from the repository root::
 """
 import json
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -183,6 +184,39 @@ class DataServerHTTPTests(unittest.TestCase):
             http_request(self.files_url("test-locked.txt"), method="PUT", data=b"y")[0],
             201,
         )
+
+    def test_lease_expires_without_a_release(self):
+        # A migration that dies mid-copy never sends DELETE /lock, so the node
+        # has to free itself once the lease runs out.
+        token = {LOCK_TOKEN_HEADER: "migration-lease"}
+        status, payload = json_request(
+            f"{self.base}/lock?seconds=1.0", method="POST", headers=token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["seconds"], 1.0)
+        self.assertEqual(self.server.lock_holder(), "migration-lease")
+        self.assertEqual(
+            http_request(self.files_url("test-lease.txt"), method="PUT", data=b"x")[0],
+            503,
+        )
+
+        deadline = time.monotonic() + 10.0
+        while self.server.lock_holder() is not None:
+            if time.monotonic() > deadline:
+                self.fail("the write lock outlived its 1.0 s lease")
+            time.sleep(0.01)
+
+        # Expiry, not release: an untokened write lands again, and a different
+        # migration can take the lock without waiting for the old holder.
+        self.assertEqual(
+            http_request(self.files_url("test-lease.txt"), method="PUT", data=b"y")[0],
+            201,
+        )
+        status, _ = json_request(
+            f"{self.base}/lock", method="POST", headers={LOCK_TOKEN_HEADER: "migration-next"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.server.lock_holder(), "migration-next")
 
 
 if __name__ == "__main__":

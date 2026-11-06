@@ -117,8 +117,29 @@ class DataStoreTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.store.delete("jdoe-missing.txt")
 
+    def test_an_escaped_dash_stays_inside_one_path_segment(self):
+        # "notes\-v2.txt" is one name (a file called notes-v2.txt) ...
+        dashed = "jdoe-home-notes\\-v2.txt"
+        self.assertEqual(
+            self.store.path_for(dashed).relative_to(self.root).parts,
+            ("jdoe", "home", "notes-v2.txt"),
+        )
+        # ... while "notes-v2.txt" is still separator, dash, separator.
+        nested = "jdoe-home-notes-v2.txt"
+        self.assertEqual(
+            self.store.path_for(nested).relative_to(self.root).parts,
+            ("jdoe", "home", "notes", "v2.txt"),
+        )
+
+        # Two objects, two files: neither overwrites the other.
+        self.store.write(dashed, b"dashed")
+        self.store.write(nested, b"nested")
+        self.assertEqual(self.store.read(dashed), b"dashed")
+        self.assertEqual(self.store.read(nested), b"nested")
+        self.assertEqual(self.store.list_keys(), [nested, dashed])
+
     def test_unusable_keys_are_refused(self):
-        for key in ["", ".", "..", "a/b", "a\\b", "a:b", "a-", "-a", "a-\x00b"]:
+        for key in ["", ".", "..", "a/b", "a\\b", "a\\", "a:b", "a-", "-a", "a-\x00b"]:
             with self.subTest(key=key), self.assertRaises(InvalidKeyError):
                 self.store.path_for(key)
         with self.assertRaises(TypeError):
@@ -150,6 +171,12 @@ class DataStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_handoff_owners(), [])
         with self.assertRaises(FileNotFoundError):
             self.store.read_handoff("jdoe-borrowed.txt", OWNER)
+
+    def test_handoff_keys_round_trip_with_an_escaped_dash(self):
+        key = "jdoe-home-notes\\-v2.txt"
+        self.store.write_handoff(key, OWNER, b"held")
+        self.assertEqual(self.store.list_handoffs(OWNER), [key])
+        self.assertEqual(self.store.read_handoff(key, OWNER), b"held")
 
     def test_handoffs_do_not_escape_the_store(self):
         with self.assertRaises(ValueError):

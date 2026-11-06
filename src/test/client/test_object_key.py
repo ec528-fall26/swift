@@ -1,8 +1,9 @@
 """Partition-key mapping checks for the swift_light client.
 
 ``object_key`` is what turns a remote object path into the key the ring hashes,
-so the tests pin its two rules: segments joined with ``-`` behind the account,
-and every value refused that the store could not turn into a safe path.
+so the tests pin its rules: segments joined with ``-`` behind the account, a
+dash inside a name escaped as ``\\-`` so it cannot pass for a separator, and
+every value refused that the store could not turn into a safe path.
 
 Run from the repository root::
 
@@ -22,6 +23,21 @@ class ObjectKeyTests(unittest.TestCase):
         self.assertEqual(object_key("a/b/file.txt", "jdoe"), "jdoe-a-b-file.txt")
         self.assertEqual(object_key("notes.txt", "jdoe"), "jdoe-notes.txt")
         self.assertEqual(object_key("a/b/c", "jdoe"), "jdoe-a-b-c")
+
+    def test_a_dash_inside_a_name_is_escaped(self):
+        # A dash that is part of the name must not read back as a separator.
+        self.assertEqual(object_key("home/notes-v2.txt", "jdoe"), "jdoe-home-notes\\-v2.txt")
+        self.assertEqual(object_key("home/notes/v2.txt", "jdoe"), "jdoe-home-notes-v2.txt")
+        self.assertEqual(object_key("-leading.txt", "jdoe"), "jdoe-\\-leading.txt")
+
+    def test_a_dashed_name_and_a_nested_path_do_not_collide(self):
+        dashed = object_key("home/notes-v2.txt", "jdoe")
+        nested = object_key("home/notes/v2.txt", "jdoe")
+        self.assertNotEqual(dashed, nested)
+
+    def test_a_dash_inside_the_account_is_escaped(self):
+        self.assertEqual(object_key("a/b", "john-doe"), "john\\-doe-a-b")
+        self.assertNotEqual(object_key("doe/a/b", "john"), object_key("a/b", "john-doe"))
 
     def test_separators_and_stray_slashes_are_normalised(self):
         self.assertEqual(object_key("a\\b\\c.txt", "jdoe"), "jdoe-a-b-c.txt")
@@ -59,6 +75,18 @@ class ObjectKeyTests(unittest.TestCase):
             store = DataStore(directory)
             path = store.path_for(object_key("a/b/file.txt", "jdoe"))
             self.assertEqual(path.relative_to(store.root).parts, ("jdoe", "a", "b", "file.txt"))
+
+    def test_a_dashed_name_becomes_one_directory_entry(self):
+        # And the escaped dash lands inside one name instead of splitting it.
+        with tempfile.TemporaryDirectory(prefix="swift-light-key-") as directory:
+            store = DataStore(directory)
+            key = object_key("home/notes-v2.txt", "jdoe")
+            self.assertEqual(
+                store.path_for(key).relative_to(store.root).parts,
+                ("jdoe", "home", "notes-v2.txt"),
+            )
+            store.write(key, b"v2")
+            self.assertEqual(store.list_keys(), [key])
 
 
 if __name__ == "__main__":

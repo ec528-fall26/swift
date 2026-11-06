@@ -131,7 +131,7 @@ python3 src/swift_light/deploy.py down
 ## 4. Running the experiments
 
 Experiments 1 and 2 need the cluster running. Experiment 0 deploys and stops its own
-cluster in the mode it measures, and experiments 3 and 4 run the test suites on
+cluster in the mode it measures, and experiments 3, 4 and 5 run the test suites on
 temporary state. Once the setup process is completed, all of them can be run in a
 separate terminal.
 
@@ -192,6 +192,11 @@ persists to disk after every vnode change, the performance will be unacceptable.
 flush 50 vnodes at once. See the *Architecture* section for details.
 
 This experiment starts and stops its own cluster.
+
+Each case is a real request to a deployed cluster, so its time includes TCP setup
+and HTTP overhead as well as the save itself. The absolute per-case numbers are
+therefore not comparable to Experiment 5's in-process timings; only the atomic and
+non-atomic runs of this experiment are compared with each other, on the same machine.
 
 #### Short version
 
@@ -283,9 +288,9 @@ a short read or a stale replica fails instead of passing quietly.
 | | |
 | --- | --- |
 | Supports | Each component behaves as specified on its own: the client's path-to-key mapping, the ring's layout and placement, the data server's file store and HTTP routes, and the proxy's heartbeat monitor. |
-| Command | `python3 experiments/swift_light/exp3_unit_tests.py` |
-| Expected runtime | Under 10 seconds. |
-| Expected output | `Ran 50 tests`, `OK`, `[exp3] OK`, and `RESULT: PASS`. |
+| Command | `python3 experiments/swift_light/exp3_unit_tests.py [MODE]` |
+| Expected runtime | Under 15 seconds. |
+| Expected output | `Ran 60 tests`, `OK`, `[exp3] OK`, and `RESULT: PASS` under atomic mode. |
 | Requires | Python 3.12 and a writable temporary directory. No deployed cluster and no `SwiftLightFiles/Hello.txt`. |
 
 #### How to run the experiment
@@ -293,7 +298,12 @@ a short read or a stale replica fails instead of passing quietly.
 ```bash
 cd <cloned swift repo directory>
 
+# atomic:
 python3 experiments/swift_light/exp3_unit_tests.py
+echo "exit=$?"
+
+# non-atomic: some tests would fail
+python3 experiments/swift_light/exp3_unit_tests.py non_atomic
 echo "exit=$?"
 ```
 
@@ -302,35 +312,39 @@ echo "exit=$?"
 ```bash
 cd /home/ubuntu/swift
 
+# atomic:
 python3 experiments/swift_light/exp3_unit_tests.py
+echo "exit=$?"
+
+# non-atomic: some tests would fail
+python3 experiments/swift_light/exp3_unit_tests.py non_atomic
 echo "exit=$?"
 ```
 
-#### Ring save atomicity tests
+#### Atomic-save and crash-injection tests
+
+These are the checks that fail under `non_atomic`.
 
 | Test case | Description |
 | --- | --- |
-| `data/test_atomic_save.py` :: `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | Makes the ring save fail at each stage (write, flush, fsync, replace). The old ring must stay unchanged and loadable, with no temporary file left and a working retry. |
-| `data/test_atomic_save.py` :: `AtomicSaveTests.test_successful_save_orders_real_io_before_atomic_replacement` | Checks the order of a successful save: write, flush, sync, close, then replace. The old ring survives until the final step. |
-| `data/test_atomic_save.py` :: `AtomicSaveTests.test_readers_see_old_before_replacement_and_new_after` | A reader running during the save sees the old ring before the replace and the new one after, never a half-written file. |
-| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_save_and_load_round_trip_in_both_write_modes` | Atomic and direct saves both reload to the same layout, so the faster mode changes durability, not meaning. |
-| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_build_refuses_to_overwrite_an_existing_ring` | A second build is refused and the existing ring file is left byte-identical, so files are never silently re-placed. |
-| `proxy/test_ring_basics.py` :: `RingConstructionTests.test_from_dict_rejects_an_inconsistent_layout` | A corrupt ring is rejected instead of served. |
-| `data/test_restart_persistence.py` :: `RestartPersistenceTests.test_completed_state_reopens_in_fresh_process` | A completed save reopens in a fresh process with the same ring state and placement. |
-
-Experiments 3 and 4 keep the exit-code convention of the cluster commands: `0`
-every test ran and passed, `1` a test failed, errored, or was skipped, and `77` the
-suite could not be attempted at all (missing tests, an unwritable `--temp-dir`, or
-no localhost connections).
+| `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | A failure while writing the temporary file must leave the old object intact, with no leftover temporary file and a working retry. |
+| `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | A failure during the flush must leave the old object intact. |
+| `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | A failure during the sync must leave the old object intact. |
+| `AtomicSaveTests.test_handled_failures_preserve_old_contents_and_remove_temporary_files` | A failure at the replace must leave the old object intact. |
+| `AtomicSaveTests.test_successful_save_orders_real_io_before_atomic_replacement` | A successful save writes, flushes, syncs and closes before it replaces anything. |
+| `AtomicSaveTests.test_readers_see_old_before_replacement_and_new_after` | A reader sees the old object until the replace, then the new one, never a mixture. |
+| `CrashAtomicityTests.test_a_kill_while_writing_the_temporary_file_preserves_the_old_contents` | A writer hard-killed half-way through the temporary file must leave the old object intact, and a later save must still succeed. |
+| `CrashAtomicityTests.test_a_kill_before_replacement_preserves_the_old_contents` | A writer hard-killed with the temporary file complete but not yet renamed must leave the old object intact. |
+| `CrashAtomicityTests.test_a_kill_after_replacement_publishes_the_new_contents` | A writer hard-killed just after the rename must leave the complete new object, never a mixture. |
 
 ### Experiment 4: the service integration test suite passes
 
 | | |
 | --- | --- |
 | Supports | The services work together end to end: a push reaches a quorum of real replicas, a pull returns the stored bytes and falls back through the fan, and the proxy answers placement and reports health for its live members. |
-| Command | `python3 experiments/swift_light/exp4_integration_tests.py` |
-| Expected runtime | Under 30 seconds. |
-| Expected output | `Ran 20 tests`, `OK`, `[exp4] OK`, and `RESULT: PASS`. |
+| Command | `python3 experiments/swift_light/exp4_integration_tests.py [MODE]` |
+| Expected runtime | Under 60 seconds. |
+| Expected output | `Ran 27 tests`, `OK`, `[exp4] OK`, and `RESULT: PASS` under atomic mode. |
 | Requires | Python 3.12 and localhost connections. No deployed cluster and no `SwiftLightFiles/Hello.txt`. |
 
 #### How to run the experiment
@@ -338,7 +352,12 @@ no localhost connections).
 ```bash
 cd <cloned swift repo directory>
 
+# atomic:
 python3 experiments/swift_light/exp4_integration_tests.py
+echo "exit=$?"
+
+# non-atomic: 
+python3 experiments/swift_light/exp4_integration_tests.py non_atomic
 echo "exit=$?"
 ```
 
@@ -347,16 +366,74 @@ echo "exit=$?"
 ```bash
 cd /home/ubuntu/swift
 
+# atomic:
 python3 experiments/swift_light/exp4_integration_tests.py
+echo "exit=$?"
+
+# non-atomic:
+python3 experiments/swift_light/exp4_integration_tests.py non_atomic
 echo "exit=$?"
 ```
 
 #### Ring save atomicity tests
 
+| Test case | Description | Fails under `non_atomic` |
+| --- | --- | --- |
+| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_torn_ring_file_never_reaches_routing` | With a half-written `ring.json` on disk, a live proxy keeps serving the ring it already loaded, so a partial file never changes placement. | No |
+| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_complete_replacement_ring_is_picked_up_whole` | After an atomic replacement, the next request uses the new ring in one step, never a mix of the old and new layout. | No |
+
+#### Migration-over-HTTP tests
+
 | Test case | Description |
 | --- | --- |
-| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_torn_ring_file_never_reaches_routing` | With a half-written `ring.json` on disk, a live proxy keeps serving the ring it already loaded, so a partial file never changes placement. |
-| `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_complete_replacement_ring_is_picked_up_whole` | After an atomic replacement, the next request uses the new ring in one step, never a mix of the old and new layout. |
+| `RemoteDataServerTests.test_list_files_filters_by_slot_and_skips_handoff_entries` | `GET /keys` is filtered to the requested slot arc and never lists another owner's handoff entries. |
+| `RemoteDataServerTests.test_write_requires_a_source_and_copies_the_stored_bytes` | `write` refuses to run before `list_files` names the source, then copies the exact bytes; a key the source lost is an error. |
+| `RemoteDataServerTests.test_write_handoff_drops_only_keys_this_arc_copied` | The source drops a key only after this arc copied it, and a `404` from an already-gone key is tolerated. |
+| `RemoteDataServerTests.test_lock_blocks_foreign_writes_but_lets_the_holder_through` | While the lease is held, foreign writes get `503`, reads and `/keys` still work, the holder's own write succeeds, and release frees the node. |
+| `RemoteDataServerTests.test_a_refused_lock_releases_the_nodes_already_acquired` | A refusal from the second node releases the first, so a failed lock leaves no node held. |
+| `RemoteDataServerTests.test_an_unreachable_server_is_a_migration_error` | A connection that cannot be made becomes `MigrationError` instead of a raw socket error. |
+| `RemoteDataServerTests.test_rebalance_moves_real_objects_onto_a_joined_server` | `add_node` copies every changed key to the joined server and hands it off from the old primary. |
+
+### Experiment 5: a write and a read stay inside the latency baseline
+
+| | |
+| --- | --- |
+| Supports | One write and one read stay inside the design proposal's performance baseline: p95 write latency `<= 50 ms` and p95 read latency `<= 20 ms`, metrics 1 and 3 of its baseline table. |
+| Command | `python3 experiments/swift_light/exp5_latency.py` |
+| Expected runtime | About a second. |
+| Expected output | A two-row timing table (cases, failures, mean, std dev, p50/p95/p99, max), a `PASS` per row, `Ran 2 tests`, `OK`, `[exp5] OK`, and `RESULT: PASS`. |
+| Requires | Python 3.12 and a writable temporary directory. No deployed cluster, no input file, and no earlier experiment. |
+
+#### How to run the experiment
+
+```bash
+cd <cloned swift repo directory>
+
+python3 experiments/swift_light/exp5_latency.py
+echo "exit=$?"
+```
+
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
+python3 experiments/swift_light/exp5_latency.py
+echo "exit=$?"
+```
+
+The measurement is a test in `src/test/performance_eval/`, and the experiment script
+runs it.  
+
+#### Note
+1. In `design-proposal`, the third metric measures sustained acknowledged writes. `exp0` covers it with 4,000 write cases.
+2. IO in this test is much faster than in `exp0` because this script runs the performance test in process, with no sockets at all:
+it calls placement and the file stores directly, so a case pays only the backend's own work.
+`exp0` drives a deployed cluster over HTTP, so every case also pays TCP setup and request overhead, and a case is three requests.
+That overhead is why `exp0`'s per-case numbers are much higher.
+3. This suite takes no `MODE` argument: it measures the atomic backend, and
+`performance_eval/test_backend_latency.py` :: `BackendLatencyTests.test_a_timed_write_reaches_every_replica`
+asserts that every server's store is atomic, so it would fail if the run were forced non-atomic.
 
 ## 5. Claims and limitations
 
@@ -375,12 +452,31 @@ automated coverage of the behaviours the tests encode:
 - **Downloads match the original file:** Experiment 2 checks the downloaded file
   byte-for-byte against the reference and reports which server supplied it. It does
   not force a primary failure or establish that fallback works during failures.
-- **Atomic mode costs a little more per write:**
+- **Atomic mode costs a little more per write:** Experiment 0 runs 10,000 cases
+  (file writes, deletes, node joins and node leaves) against a deployed cluster in
+  each mode and reports per-case milliseconds, p50/p95/p99 and cases per second.
+  Atomic mode costs more in each category, but by a margin small next to the cost
+  of the request itself: the extra work is the temporary-file write, flush, fsync
+  and atomic replace, which happen once per save, while the case still pays for
+  lookup, quorum writes and HTTP. What that buys is a ring that never lands
+  half-written. The two runs are compared from their JSON reports side by side; a
+  gap smaller than the reported sample standard deviation is jitter, not a result.
+  This measures cost, not crash survival.
+- **One write and one read stay inside the latency baseline:** Experiment 5 times
+  100 writes and 100 reads one at a time against a real ring and real file stores
+  and reports p95 10.93 ms for writes and 2.83 ms for reads, against the 50 ms and
+  20 ms budgets. The measurement runs in process, with no sockets at all, so these
+  are the backend's own placement, storage and durable-write costs -- a floor for
+  the client-visible latency, which is higher by whatever the HTTP stack and the
+  TCP setup add. It is not a load test; the sustained acknowledged-write metric
+  is measured separately by Experiment 0, over the network.
 - **The specified behaviours hold under the tests' scenarios:** Experiment 3 runs the
   unit suites and experiment 4 the service integration suite. A passing run shows
   placement, quorum writes with substitute fallback, read fallback, atomic-save
-  safety, and persistence behaving as those tests specify. These are checks of the
-  described scenarios, not evidence about the deployed cluster under failure.
+  safety -- including a writer hard-killed mid-write, before the rename and after
+  it -- and persistence behaving as those tests specify. These are checks of the
+  described scenarios, not evidence about the deployed cluster under failure, and
+  the hard kill is not power loss: the operating system stays up.
 
 ### Limitations
 

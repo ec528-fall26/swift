@@ -7,6 +7,7 @@ Everything here drives the deployed topology rather than a single component:
 * ``test_read_fallback.py``      -- client read order against real data servers
 * ``test_proxy_http.py``         -- proxy routing and heartbeats with real members
 * ``test_ring_atomicity.py``     -- ring replacement seen through a live proxy
+* ``test_remote_migration.py``   -- ring migration over HTTP against real servers
 
 The servers, proxies and rings are started in-process on OS-assigned loopback
 ports with temporary state, so the tests still need no deployed cluster.  Tests
