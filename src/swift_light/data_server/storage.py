@@ -28,6 +28,20 @@ Unlike ``ring.json``, this file is *not* write-once.  Reconfiguring a server --
 moving it, or pointing it at a new proxy -- is a normal event, so saving over an
 existing file is exactly how that change is recorded.
 
+Write modes
+-----------
+A store is *atomic* (the default) or *non-atomic*.  Atomic mode keeps every
+write crash-safe: the bytes go to a temp file in the same directory, are flushed
+to storage, and are then renamed over the destination, so a reader -- or a
+reboot -- only ever sees a complete file.  Non-atomic mode skips all that: the
+bytes are written straight to the destination file and flushed to disk.  That is
+one file opened instead of a temp file plus a rename, but an interruption in the
+middle of the write leaves the destination truncated instead of untouched.
+
+The mode is chosen when the cluster is deployed -- ``deploy.py up atomic`` (the
+default) or ``deploy.py up non_atomic`` -- and is fixed for the life of a
+:class:`DataStore`.
+
 Files
 -----
 Besides its parameters the server holds the files themselves.  :class:`DataStore`
@@ -37,8 +51,19 @@ object's path written with ``-`` between its segments::
 
     JohnDoe-home-documents-hello.txt   ->   store/JohnDoe/home/documents/hello.txt
 
+A ``-`` is the key's separator, so a dash that belongs to a real name is written
+``\\-`` and stays inside its segment::
+
+    jdoe-home-notes\\-v2.txt   ->   store/jdoe/home/notes-v2.txt
+    jdoe-home-notes-v2.txt     ->   store/jdoe/home/notes/v2.txt
+
+Without that, one object's key would read as the other's, and a file name with
+a dash would silently become an extra directory level.  The backslash is free to
+escape with because it is a path separator and is never part of a segment.
+
 A read for a key the store does not hold raises :class:`FileNotFoundError`; a key
-that cannot be a safe path -- empty, ``.``/``..``, a path separator -- raises
+that cannot be a safe path -- empty, ``.``/``..``, a path separator, an escape
+that does not hide a dash -- raises
 :class:`InvalidKeyError`.  Writes go through the same atomic temp-file-and-rename
 step :meth:`DataServerConfig.save` uses, so a crash never leaves a half-written
 file.  A delete is atomic too -- the file is renamed to a throwaway name first --
@@ -102,7 +127,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import quote, unquote, urlsplit
 
 __all__ = [
@@ -236,29 +261,46 @@ class DataStore:
 
     A partition key is the object's path written with ``-`` between its
     segments: ``JohnDoe-home-documents-hello.txt`` names
-    ``JohnDoe/home/documents/hello.txt``.  The key is turned into a path under
+    ``JohnDoe/home/documents/hello.txt``.  A dash that is part of a name rather
+    than a separator is written ``\\-``, so ``jdoe-home-notes\\-v2.txt`` names
+    ``jdoe/home/notes-v2.txt``.  The key is turned into a path under
     :attr:`root` and the bytes are read or written there.
 
-    Writes and deletes are atomic -- the same temp-file-and-rename step
-    :meth:`DataServerConfig.save` uses -- so a crash never leaves a half-written
-    or half-deleted file.  A read for a key that is not held raises
+    In atomic mode (the default) writes and deletes are crash-safe -- the same
+    temp-file-and-rename step :meth:`DataServerConfig.save` uses -- so a crash
+    never leaves a half-written or half-deleted file.  In non-atomic mode the
+    bytes are written straight to the destination and flushed, with no temp file
+    and no rename.  A read for a key that is not held raises
     :class:`FileNotFoundError` rather than returning nothing, and a delete prunes
     any directory branch the file alone kept alive.
     """
 
-    __slots__ = ("_root",)
+    __slots__ = ("_root", "_atomic")
 
-    def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        root: str | os.PathLike[str] | None = None,
+        *,
+        atomic: bool = True,
+    ) -> None:
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
         self._root = (
             Path(root)
             if root is not None
             else Path(__file__).with_name(DEFAULT_STORE_DIRNAME)
         )
+        self._atomic = atomic
 
     @property
     def root(self) -> Path:
         """The directory the files live under."""
         return self._root
+
+    @property
+    def atomic(self) -> bool:
+        """Whether writes and deletes go through a temp file and a rename."""
+        return self._atomic
 
     def path_for(self, key: str) -> Path:
         """The path ``key`` names, checked to stay inside :attr:`root`.
@@ -283,27 +325,59 @@ class DataStore:
         return path.read_bytes()
 
     def write(self, key: str, data: bytes) -> Path:
-        """Atomically store ``data`` for ``key`` and return where it landed."""
+        """Store ``data`` for ``key`` and return where it landed.
+
+        Atomic in atomic mode (temp file, flush, rename); a direct write and a
+        flush in non-atomic mode.
+        """
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"data must be bytes-like, got {type(data).__name__}")
         path = self.path_for(key)
-        _atomic_write_bytes(path, bytes(data))
+        _write_bytes(path, bytes(data), atomic=self._atomic)
         return path
 
     def delete(self, key: str) -> Path:
         """Atomically remove the file for ``key``; prune the empty branch.
 
-        Raises :class:`FileNotFoundError` if no file is stored for ``key``.  The
-        file is renamed out of the way before it is unlinked (see
-        :func:`_atomic_delete`), then any directory that only this file kept
-        alive is removed, up to :attr:`root`.
+        Raises :class:`FileNotFoundError` if no file is stored for ``key``.  In
+        atomic mode the file is renamed out of the way before it is unlinked
+        (see :func:`_atomic_delete`); in non-atomic mode it is unlinked in
+        place.  Either way any directory that only this file kept alive is then
+        removed, up to :attr:`root`.
         """
         path = self.path_for(key)
         if not path.is_file():
             raise FileNotFoundError(f"no file for partition key {key!r}")
-        _atomic_delete(path)
+        _remove_file(path, atomic=self._atomic)
         _remove_empty_branches(path.parent, self._root)
         return path
+
+    def list_keys(self) -> list[str]:
+        """Every partition key this server actually holds, sorted.
+
+        The inverse of :meth:`path_for`: each stored file's path is turned back
+        into a key by joining its segments with ``-``, escaping a dash that is
+        part of a name (see :func:`_key_from_parts`) so the key reads back the
+        way it was written.  Handoff trees are
+        skipped -- a directory whose name decodes to a full URL holds objects
+        belonging to somebody else, not this server's own -- and so are leftover
+        ``.tmp`` files from an interrupted write.
+
+        A membership change uses this to find the files in the arcs it has to
+        move.  The cost is one walk of the store, so it is a migration-time
+        operation, not something a request path should call.
+        """
+        if not self._root.is_dir():
+            return []
+        keys: list[str] = []
+        for path in self._root.rglob("*"):
+            if not path.is_file() or path.name.endswith(_TEMP_SUFFIX):
+                continue
+            relative = path.relative_to(self._root)
+            if _is_handoff_dirname(relative.parts[0]):
+                continue
+            keys.append(_key_from_parts(relative.parts))
+        return sorted(keys)
 
     # -- handoff ------------------------------------------------------------
 
@@ -329,7 +403,7 @@ class DataStore:
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"data must be bytes-like, got {type(data).__name__}")
         path = self.handoff_path_for(key, from_node)
-        _atomic_write_bytes(path, bytes(data))
+        _write_bytes(path, bytes(data), atomic=self._atomic)
         return path
 
     def read_handoff(self, key: str, from_node: str) -> bytes:
@@ -354,7 +428,7 @@ class DataStore:
         is written atomically, at the same path a write handoff uses.
         """
         path = self.handoff_path_for(key, from_node)
-        _atomic_write_bytes(path, HANDOFF_DELETE_MARKER)
+        _write_bytes(path, HANDOFF_DELETE_MARKER, atomic=self._atomic)
         return path
 
     def is_delete_handoff(self, key: str, from_node: str) -> bool:
@@ -386,14 +460,16 @@ class DataStore:
 
         Walks ``from_node``'s handoff directory and turns each stored path back
         into a key -- the inverse of :meth:`handoff_path_for`.  The round trip is
-        sound because a key's segments can never contain the ``-`` the key is
-        split on.  Leftover ``.tmp`` files from an interrupted write are skipped.
+        sound because a key's segments can never contain an unescaped ``-``: a
+        dash that is part of a name is written ``\\-``, both on the way in and on
+        the way back out.  Leftover ``.tmp`` files from an interrupted write are
+        skipped.
         """
         owner_dir = self._root / _handoff_dirname(from_node)
         if not owner_dir.is_dir():
             return []
         keys = [
-            "-".join(path.relative_to(owner_dir).parts)
+            _key_from_parts(path.relative_to(owner_dir).parts)
             for path in owner_dir.rglob("*")
             if path.is_file() and not path.name.endswith(_TEMP_SUFFIX)
         ]
@@ -402,8 +478,8 @@ class DataStore:
     def clear_handoff(self, key: str, from_node: str) -> Path:
         """Remove a handoff once it has been applied or delivered.
 
-        Like :meth:`delete`, but in the handoff tree: the entry is removed
-        atomically and the empty branch pruned.  Raises
+        Like :meth:`delete`, but in the handoff tree: the entry is removed (in
+        the store's configured mode) and the empty branch pruned.  Raises
         :class:`FileNotFoundError` if nothing is held for ``key``.
         """
         path = self.handoff_path_for(key, from_node)
@@ -411,7 +487,7 @@ class DataStore:
             raise FileNotFoundError(
                 f"no handoff for partition key {key!r} from {from_node!r}"
             )
-        _atomic_delete(path)
+        _remove_file(path, atomic=self._atomic)
         _remove_empty_branches(path.parent, self._root)
         return path
 
@@ -436,6 +512,15 @@ def _valid_address(name: str, value: Any) -> str:
     return address
 
 
+def _is_handoff_dirname(name: str) -> bool:
+    """Whether a store subdirectory names a handoff owner (a full URL)."""
+    try:
+        _valid_address("from_node", unquote(name))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _handoff_dirname(node: str) -> str:
     """One safe directory name for ``node``, a full URL percent-encoded.
 
@@ -458,15 +543,18 @@ def _key_to_relative_path(key: str) -> Path:
     """Turn a ``-``-separated partition key into a relative path.
 
     ``JohnDoe-home-documents-hello.txt`` becomes
-    ``JohnDoe/home/documents/hello.txt``.  Anything that is not a plain
-    sequence of path segments is refused, so a key can never climb out of the
-    store.
+    ``JohnDoe/home/documents/hello.txt``.  A segment that itself contains a dash
+    writes it ``\\-``, so ``jdoe-home-notes\\-v2.txt`` names
+    ``jdoe/home/notes-v2.txt`` while ``jdoe-home-notes-v2.txt`` names
+    ``jdoe/home/notes/v2.txt`` -- the two names stay apart.  Anything that is not
+    a plain sequence of path segments is refused, so a key can never climb out of
+    the store.
     """
     if not isinstance(key, str):
         raise TypeError(f"partition key must be a str, got {type(key).__name__}")
     if not key:
         raise InvalidKeyError("partition key must not be empty")
-    segments = key.split("-")
+    segments = _split_key(key)
     for segment in segments:
         if (
             segment in ("", ".", "..")
@@ -477,6 +565,47 @@ def _key_to_relative_path(key: str) -> Path:
         ):
             raise InvalidKeyError(f"partition key {key!r} is not a usable path")
     return Path(*segments)
+
+
+def _split_key(key: str) -> list[str]:
+    """Cut ``key`` at its unescaped dashes, unescaping ``\\-`` back to ``-``.
+
+    The only thing an escape may hide is a dash, so a key that ends in one, or
+    has one in front of any other character, is refused -- it did not come from
+    a client's ``object_key`` and its segment boundaries would be a guess.
+
+    Raises :class:`InvalidKeyError` for such a key.
+    """
+    segments: list[str] = []
+    segment: list[str] = []
+    index = 0
+    while index < len(key):
+        character = key[index]
+        if character == "\\":
+            index += 1
+            if index == len(key) or key[index] != "-":
+                raise InvalidKeyError(
+                    f"partition key {key!r} has an escape that hides no dash"
+                )
+            segment.append("-")
+        elif character == "-":
+            segments.append("".join(segment))
+            segment = []
+        else:
+            segment.append(character)
+        index += 1
+    segments.append("".join(segment))
+    return segments
+
+
+def _key_from_parts(parts: Iterable[str]) -> str:
+    """The key naming ``parts`` -- the inverse of :func:`_split_key`.
+
+    A dash inside one of the parts is escaped, so a path such as
+    ``jdoe/home/notes-v2.txt`` comes back as ``jdoe-home-notes\\-v2.txt`` and
+    not as five segments.
+    """
+    return "-".join(part.replace("-", "\\-") for part in parts)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -500,6 +629,48 @@ def _fsync_directory(directory: Path) -> None:
 def _atomic_write_text(target: Path, text: str) -> None:
     """Write ``text`` to ``target`` as UTF-8, atomically."""
     _atomic_write_bytes(target, text.encode("utf-8"))
+
+
+def _write_bytes(target: Path, data: bytes, *, atomic: bool) -> None:
+    """Store ``data`` at ``target`` in the mode the store was configured with.
+
+    ``atomic`` routes to :func:`_atomic_write_bytes` (temp file, flush, rename);
+    otherwise the bytes go straight to the destination and are flushed there.
+    """
+    if atomic:
+        _atomic_write_bytes(target, data)
+    else:
+        _write_bytes_direct(target, data)
+
+
+def _write_bytes_direct(target: Path, data: bytes) -> None:
+    """Write ``data`` straight to ``target`` and flush it -- no rename.
+
+    The destination is truncated before the bytes are written, so an
+    interruption leaves it half-written.  That is the trade a non-atomic write
+    makes: one file and one flush instead of a temp file and a rename.
+    """
+    directory = target.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(target, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(directory)
+
+
+def _remove_file(target: Path, *, atomic: bool) -> None:
+    """Remove ``target`` in the mode the store was configured with.
+
+    ``atomic`` renames the file out of the way before unlinking it (see
+    :func:`_atomic_delete`); otherwise it is unlinked in place and the directory
+    flushed.
+    """
+    if atomic:
+        _atomic_delete(target)
+        return
+    target.unlink()
+    _fsync_directory(target.parent)
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:

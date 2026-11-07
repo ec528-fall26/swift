@@ -31,11 +31,22 @@ counted failed and answers again is asked to reconcile its handoffs
 while it was unreachable, and those entries have to come home.  This is the
 same reconciliation the data server runs at boot.
 
+Membership changes
+------------------
+The ring file may be replaced while the proxy runs -- ``deploy.py add-node``
+and ``remove-node`` rewrite it.  The proxy compares the file's size and
+modification time on every request that needs the membership (``/servers``,
+``/nodes``, ``/heartbeat``) and reloads it when they differ, so adding or
+removing a node takes effect without a restart.  A file caught half-written
+(possible in non-atomic mode) is ignored: the ring already in memory keeps
+serving and the next request tries again.
+
 Which data servers exist is not a second list kept here.  Startup loads the
-cluster's persisted ring once and keeps it on the proxy, then heartbeats every
-node it lists -- so the proxy's view of membership and the ring's can never
-drift apart.  The proxy only ever *reads* the ring: it is built once at cluster
-setup, and the proxy never writes it back.
+cluster's persisted ring and keeps it on the proxy, reloading it when the file
+changes, then heartbeats every node it lists -- so the proxy's view of
+membership and the ring's can never drift apart.  The proxy only ever *reads*
+the ring: membership changes are written by the process that drives them
+(``deploy.py``), never by the proxy.
 
 Transport
 ---------
@@ -84,14 +95,19 @@ Tests live in ``src/test/``; this module has no entry point of its own.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from swift_light.proxy_server.consistent_hashing_ring import ConsistentHashingRing
+from swift_light.proxy_server.consistent_hashing_ring import (
+    DEFAULT_RING_FILENAME,
+    ConsistentHashingRing,
+)
 from swift_light.proxy_server.heartbeat import (
     DEFAULT_FAIL_AFTER_SECONDS,
     Heartbeat,
@@ -118,6 +134,18 @@ DEFAULT_HOST = ""
 
 DEFAULT_RECONCILE_TIMEOUT = 2.0
 """Seconds to wait for a reconnected data server to accept a reconcile request."""
+
+_log = logging.getLogger(__name__)
+"""Reports a ring file that changed but could not be loaded."""
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """Size and modification time of ``path``, or ``None`` if it is absent."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 class _ProxyRequestServer(ThreadingHTTPServer):
@@ -178,6 +206,7 @@ class _JsonHandler(BaseHTTPRequestHandler):
 
     def _nodes(self) -> None:
         """Answer ``GET /nodes``: every data server, straight from the ring."""
+        self._proxy._maybe_reload_ring()
         self._send_json(200, {"nodes": list(self._proxy.ring.nodes)})
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -254,6 +283,7 @@ class UserHandler(_JsonHandler):
             self._send_error_json(400, "missing required query parameter 'key'")
             return
         key = keys[0]
+        self._proxy._maybe_reload_ring()
         ring = self._proxy.ring
         self._send_json(
             200,
@@ -300,11 +330,16 @@ class ProxyHTTPServer:
         host: str = DEFAULT_HOST,
         fail_after_seconds: float = DEFAULT_FAIL_AFTER_SECONDS,
     ) -> None:
-        # Loaded from its persisted file once and kept: the ring is the
-        # membership for the boot probe below and every later re-probe, and it
-        # is what port 8000 will route with.  complete=False so a proxy can
-        # boot mid-rebalance.
-        self.ring = ConsistentHashingRing.load(ring_path, complete=False)
+        # The ring is the membership: loaded once here so a proxy can boot
+        # mid-rebalance (complete=False), and reloaded by _maybe_reload_ring()
+        # when a membership change replaces the file.
+        self._ring_path = (
+            Path(ring_path)
+            if ring_path is not None
+            else Path(__file__).with_name(DEFAULT_RING_FILENAME)
+        )
+        self.ring = ConsistentHashingRing.load(self._ring_path, complete=False)
+        self._ring_signature = _file_signature(self._ring_path)
         self.heartbeat = Heartbeat(fail_after_seconds=fail_after_seconds)
         for server in self.ring.nodes:
             self.heartbeat.log_heartbeat(server)
@@ -331,8 +366,44 @@ class ProxyHTTPServer:
 
     # -- heartbeat ----------------------------------------------------------
 
+    def _maybe_reload_ring(self) -> None:
+        """Re-read the ring file when a membership change has replaced it.
+
+        The ring is loaded once at boot, so a node added or removed while this
+        proxy runs would otherwise stay invisible to routing and heartbeats.
+        Size and modification time are compared first, so the usual case --
+        unchanged -- costs one ``stat``.  A present but unusable file (a
+        non-atomic writer caught mid-write) is ignored: the ring already in
+        memory keeps serving, and the next request tries again.
+        """
+        signature = _file_signature(self._ring_path)
+        if signature is None or signature == self._ring_signature:
+            return
+        try:
+            ring = ConsistentHashingRing.load(self._ring_path, complete=False)
+        except (OSError, ValueError) as exc:
+            _log.warning(
+                "ignoring an unusable ring at %s (%s); keeping the loaded one",
+                self._ring_path,
+                exc,
+            )
+            return
+        with self._lock:
+            self.ring = ring
+            self._ring_signature = signature
+            members = set(ring.nodes)
+            for server in list(self.heartbeat.get_status()):
+                if server not in members:
+                    self.heartbeat.forget(server)
+        _log.info(
+            "ring reloaded from %s: %d data servers",
+            self._ring_path,
+            len(ring.nodes),
+        )
+
     def heartbeat_status(self) -> dict[str, dict[str, Any]]:
         """The data servers' health, as ``Heartbeat.get_status()`` reports it."""
+        self._maybe_reload_ring()
         return self.heartbeat.get_status()
 
     def refresh_heartbeats(self) -> dict[str, dict[str, Any]]:
@@ -348,6 +419,7 @@ class ProxyHTTPServer:
         slow reconcile request never delays the next re-probe.
         """
         recovered: list[str] = []
+        self._maybe_reload_ring()
         with self._lock:
             before = self.heartbeat.get_status()
             for server in self.ring.nodes:
