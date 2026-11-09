@@ -155,15 +155,15 @@ for this experiment only. Detailed setup instructions are included in the bash c
 ```bash
 cd <cloned swift repo directory>
 
-python3 src/swift_light/deploy.py up non_atomic
-python3 experiments/swift_light/exp0_atomic_overhead.py --mode non_atomic --json non_atomic.json
+python src/swift_light/deploy.py up non_atomic
+python experiments/swift_light/exp0_atomic_overhead.py --mode non_atomic --json non_atomic.json
 echo "exit=$?"
-python3 src/swift_light/deploy.py down
+python src/swift_light/deploy.py down
 
-python3 src/swift_light/deploy.py up
-python3 experiments/swift_light/exp0_atomic_overhead.py --mode atomic --json atomic.json
+python src/swift_light/deploy.py up
+python experiments/swift_light/exp0_atomic_overhead.py --mode atomic --json atomic.json
 echo "exit=$?"
-python3 src/swift_light/deploy.py down
+python src/swift_light/deploy.py down
 ```
 
 #### In the team's LightSail instance
@@ -382,18 +382,6 @@ echo "exit=$?"
 | `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_torn_ring_file_never_reaches_routing` | With a half-written `ring.json` on disk, a live proxy keeps serving the ring it already loaded, so a partial file never changes placement. | No |
 | `service_integration_test/test_ring_atomicity.py` :: `RingReplacementTests.test_a_complete_replacement_ring_is_picked_up_whole` | After an atomic replacement, the next request uses the new ring in one step, never a mix of the old and new layout. | No |
 
-#### Migration-over-HTTP tests
-
-| Test case | Description |
-| --- | --- |
-| `RemoteDataServerTests.test_list_files_filters_by_slot_and_skips_handoff_entries` | `GET /keys` is filtered to the requested slot arc and never lists another owner's handoff entries. |
-| `RemoteDataServerTests.test_write_requires_a_source_and_copies_the_stored_bytes` | `write` refuses to run before `list_files` names the source, then copies the exact bytes; a key the source lost is an error. |
-| `RemoteDataServerTests.test_write_handoff_drops_only_keys_this_arc_copied` | The source drops a key only after this arc copied it, and a `404` from an already-gone key is tolerated. |
-| `RemoteDataServerTests.test_lock_blocks_foreign_writes_but_lets_the_holder_through` | While the lease is held, foreign writes get `503`, reads and `/keys` still work, the holder's own write succeeds, and release frees the node. |
-| `RemoteDataServerTests.test_a_refused_lock_releases_the_nodes_already_acquired` | A refusal from the second node releases the first, so a failed lock leaves no node held. |
-| `RemoteDataServerTests.test_an_unreachable_server_is_a_migration_error` | A connection that cannot be made becomes `MigrationError` instead of a raw socket error. |
-| `RemoteDataServerTests.test_rebalance_moves_real_objects_onto_a_joined_server` | `add_node` copies every changed key to the joined server and hands it off from the old primary. |
-
 ### Experiment 5: a write and a read stay inside the latency baseline
 
 | | |
@@ -490,3 +478,4 @@ system becomes unavailable.
 - The system does not distinguish admin from regular clients, so anyone can perform admin operations to the cluster
 (add/remove nodes). This is fine since this system is essentially a test bench, but such logic should not be allowed
 in production.
+- 

@@ -86,6 +86,17 @@ same-mode repeat moves a mean by a few percent here, so a gap between the modes
 that is smaller than the deviation is not a result.  A category with fewer than
 two cases has no spread to report and prints a dash.
 
+Two further averages isolate the write itself, with no network in the loop.
+The **ring save** is one rebalance batch's ring write -- the fixed
+``ring.json.temp`` flushed and then renamed over the live ring in atomic mode,
+or the live ring flushed in place in non-atomic mode; the **file write** is one
+``DataStore.write``, the call a data server's ``PUT /files`` makes.  Both are
+run directly on this machine's filesystem, so a sample is only the filesystem
+work the workload itself does -- no lookup, HTTP or TCP setup is counted.
+Only the mode the run was given is measured, so the report stays one mode; run
+the other mode for its numbers.  These are what that mode costs in processing;
+the case means above add the network and the in-memory work around it.
+
 The cases go through the shipped client's own lookup and quorum code, but over
 one reused connection per server (:class:`KeepAliveClient`): opening a new
 connection per request costs about 11 ms on loopback, and a case is three
@@ -134,6 +145,7 @@ from swift_light.client.client import (  # noqa: E402
     Client,
     ClientError,
 )
+from swift_light.data_server.storage import DataStore  # noqa: E402
 from swift_light.proxy_server import consistent_hashing_ring as _ring  # noqa: E402
 from swift_light.proxy_server.consistent_hashing_ring import (  # noqa: E402
     ConsistentHashingRing,
@@ -179,6 +191,9 @@ DEFAULT_SEED = 0
 
 DEFAULT_PROGRESS_EVERY = 1000
 """Cases between progress lines (to stderr)."""
+
+PURE_SAMPLES = 200
+"""Repetitions behind each pure-processing average (no network in the loop)."""
 
 FILE_WRITE = "file write"
 FILE_DELETE = "file delete"
@@ -525,6 +540,73 @@ def _ring_change(
     return False
 
 
+def _ring_write(ring: ConsistentHashingRing, target: Path, *, atomic: bool) -> None:
+    """One ring write, down the path a rebalance batch actually takes.
+
+    A rebalance never calls ``save(atomic=True)`` for its batches: it writes the
+    fixed ``ring.json.temp`` directly, then renames that over the live ring.  So
+    the temp file is reused rather than recreated, and atomic mode pays the
+    rename and the second directory flush.  Reproducing that here is what keeps
+    the sample comparable with the ring work the workload does.
+    """
+    if not atomic:
+        ring.save(target, atomic=False)
+        return
+    temp_path = _ring._temp_path(target)
+    ring.save(temp_path, atomic=False)
+    _ring._install_prepared(temp_path, target)
+
+
+def _measure_pure(
+    ring: ConsistentHashingRing,
+    ring_directory: Path,
+    *,
+    payload: bytes,
+    atomic: bool,
+    samples: int = PURE_SAMPLES,
+) -> dict[str, Any]:
+    """Average the ring save and the file write for the run's own mode.
+
+    Both are the production write paths -- a rebalance batch's ring write (see
+    :func:`_ring_write`) and ``DataStore.write``, the call a data server's
+    ``PUT /files`` makes -- run directly on this machine's filesystem.  A sample
+    is therefore only the filesystem work a write does: a temp file, a flush and
+    a rename in atomic mode; a direct flush in non-atomic mode.  No lookup, no
+    HTTP and no TCP setup is in the loop, so these are the processing times the
+    run's mode costs.
+
+    Only the mode the run was given is measured, so a report stays one mode.
+    The ring is written beside the deployed ring (same filesystem); the scratch
+    files are removed afterwards.
+    """
+    mode = "atomic" if atomic else "non_atomic"
+    store_root = Path(tempfile.mkdtemp(prefix="swift-bench-store-"))
+    try:
+        ring_path = ring_directory / f"bench_save_{mode}.json"
+        _remove_scratch_ring(ring_path)
+        try:
+            started = time.perf_counter()
+            for _ in range(samples):
+                _ring_write(ring, ring_path, atomic=atomic)
+            ring_seconds = time.perf_counter() - started
+        finally:
+            _remove_scratch_ring(ring_path)
+
+        store = DataStore(store_root / mode, atomic=atomic)
+        started = time.perf_counter()
+        for index in range(samples):
+            store.write(f"bench-pure-{index}.bin", payload)
+        file_seconds = time.perf_counter() - started
+    finally:
+        shutil.rmtree(store_root, ignore_errors=True)
+    return {
+        "mode": mode,
+        "samples": samples,
+        "ring_save_ms": ring_seconds / samples * 1000.0,
+        "file_write_ms": file_seconds / samples * 1000.0,
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Execute the workload and return the report as a plain dict."""
     rng = random.Random(args.seed)
@@ -646,6 +728,13 @@ def _workload(
                 break
         shutil.rmtree(directory, ignore_errors=True)
 
+        pure = _measure_pure(
+            deployed,
+            scratch.parent,
+            payload=_payload_bytes(args.bytes),
+            atomic=atomic,
+        )
+
         result = {
             "mode": args.mode,
             "proxy": args.proxy,
@@ -657,6 +746,7 @@ def _workload(
             "seed": args.seed,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "seconds": measured,
+            "pure_processing": pure,
             "ring_file_bytes": ring_bytes,
             "categories": {
                 name: _summary(name, timings[name], failures[name])
@@ -798,6 +888,15 @@ def print_report(result: dict[str, Any]) -> None:
             f"{ring_seconds / result['ring_writes'] * 1000:.3f} ms per ring write "
             f"(includes the rebalance's in-memory work)"
         )
+    pure = result.get("pure_processing")
+    if pure:
+        print()
+        print(
+            f"  processing only   {pure['mode']} writes, {pure['samples']} "
+            f"samples each, no lookup/HTTP/TCP"
+        )
+        print(f"    {'ring save':<14}{pure['ring_save_ms']:>9.3f} ms")
+        print(f"    {'file write':<14}{pure['file_write_ms']:>9.3f} ms")
     if result["leftover_objects"]:
         print(
             f"  cleaned up        {result['leftover_objects']} leftover objects "
