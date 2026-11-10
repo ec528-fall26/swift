@@ -478,4 +478,9 @@ system becomes unavailable.
 - The system does not distinguish admin from regular clients, so anyone can perform admin operations to the cluster
 (add/remove nodes). This is fine since this system is essentially a test bench, but such logic should not be allowed
 in production.
-- 
+- Adding or removing a node has no fault tolerance: the migration copies each object only from
+its arc's old primary, so a data server that has already died cannot be drained or replaced.
+`remove-node` refuses to run while that server is not answering, and `add-node` cannot rebuild
+its objects from the surviving replicas. If the process driving the migration crashes partway
+through, the migration stops halfway and has to be re-run, and until it is, the ring and the
+objects can be out of step.
