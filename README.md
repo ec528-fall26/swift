@@ -35,6 +35,7 @@ they do not require the Swift Light cluster.
 | `docs/` | Design proposal and design document |
 | `slides/` | Demo slides (`demo-1.pdf`, `demo-2.pdf`, ...) |
 | `src/` | Source code |
+| `src/test/` | Unit tests (`client/`, `data/`, `proxy/`) and end-to-end tests (`service_integration_test/`) |
 | `experiments/` | Scripts that reproduce every result you claim |
 
 ## Reproducing our results
