@@ -804,20 +804,19 @@ SAIO rings or establish correctness during live rebalance or object migration.
 
 #### Prerequisites
 
-Run the SAIO experiments on the team's **Ubuntu-SAIO** Lightsail instance.
-Graders must select **Ubuntu-SAIO** in the Lightsail console and connect to
-that instance; do not use the separate SwiftBugFix instance for this procedure.
-Ubuntu-SAIO contains the prepared local Swift deployment and mounted SAIO
-storage required by the integrated runner.
+Run the SAIO experiments on the team's Ubuntu-SAIO Lightsail instance,
+using the `demo3fixed` branch. Ubuntu-SAIO contains the prepared local Swift
+deployment and mounted SAIO storage used by the integrated runner.
+The separate SwiftBugFix instance is not used for this procedure.
 
 Run as the normal `ubuntu` user, not as root and not with `sudo bash`.
+
+Use the `demo3fixed` branch for the integrated SAIO experiment.
 
 The checkout must include `saio_atomic_under_load.py`,
 `run_saio_atomic_under_load.sh`, `saio_scale_tests_expanded.py`, experiments
 2–4 and 6–12, and their support files in `experiments/`. The expanded workload
-script must be the version supporting `--sustain` and the runner's readiness
-marker. Use the checkout containing these submitted files; do not switch to
-an older branch that lacks them.
+script must support `--sustain` and the runner's readiness marker.
 
 The launcher is sufficient to start the integrated test on that prepared
 instance. It selects `.venv/bin/python` automatically and prepares only the
@@ -841,10 +840,11 @@ bash experiments/run_saio_atomic_under_load.sh
 echo "exit=$?"
 ```
 
-#### In the team's LightSail instance
+#### In the team's Lightsail instance
 
 ```bash
 cd /home/ubuntu/EC528_swift
+git switch demo3fixed
 bash experiments/run_saio_atomic_under_load.sh
 echo "exit=$?"
 ```
@@ -930,6 +930,7 @@ For an incomplete execution, compare `test_execution`, `exit_code`,
 `overlap_verified`, and `successful_requests_fully_during_experiment` in the
 summary and inspect that experiment's log. Do not reinterpret incomplete
 coverage as either an assertion failure or a verified pass.
+
 
 
 ## 5. Claims and limitations
