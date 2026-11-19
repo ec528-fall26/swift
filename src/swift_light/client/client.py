@@ -30,19 +30,38 @@ name in front::
 
     a/b/file.txt   by user jdoe   ->   key "jdoe-a-b-file.txt"
 
+A ``-`` is the key's separator, so one inside the account or a path segment is
+escaped as ``\\-`` and cannot be confused with a separator::
+
+    home/notes-v2.txt   by user jdoe   ->   key "jdoe-home-notes\\-v2.txt"
+    home/notes/v2.txt   by user jdoe   ->   key "jdoe-home-notes-v2.txt"
+
+Without that, those two objects would share one key and one another's bytes.
+The backslash is free to escape with because it is a path separator, never part
+of a segment.
+
 The account name is the operating system's login name unless ``--user`` names
 another one.  A path this cannot turn into a usable key is refused before
 anything is sent.
 
 Durability
 ----------
-A write is not sent to one server.  ``push`` and ``delete`` walk the fan in
-order until ``replicate_count`` servers have durably accepted the change -- the
-*quorum* -- so a write still succeeds while a replica is down, because the
-handoff servers later in the fan take its place.  The report says how many
-replicas acknowledged, and the command fails (exit 1) when the quorum is not
-reached.  A delete of a key a server does not hold counts as accepted: the
-object is already gone there, which is the outcome asked for.
+A write is not sent to one server.  ``push`` and ``delete`` send the change to
+the whole *replica set* -- the first ``replicate_count`` servers of the fan --
+**at once**, one thread per copy, and count the ones that durably accepted it.
+That count is the *quorum*: a write costs one round trip, however many copies
+it keeps, instead of one round trip per copy.
+
+A write still succeeds while a replica is down, because a short quorum then
+goes on to the handoff servers later in the fan, in fan order, until the quorum
+is met -- the sloppy quorum.  That second phase is deliberately serial and
+stops the moment the quorum is reached: it is the degraded path, and writing
+more substitutes than the quorum needs would only leave the later handoff
+reconciliation more to undo.
+
+The report says how many replicas acknowledged, and the command fails (exit 1)
+when the quorum is not reached.  A delete of a key a server does not hold counts
+as accepted: the object is already gone there, which is the outcome asked for.
 
 A read is the other way round.  ``pull`` goes to the primary (``fan[0]``) and
 falls back to the next server only when the primary is unreachable or does not
@@ -89,6 +108,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -123,7 +143,7 @@ EXIT_ENVIRONMENT = 77
 _PATH_SEPARATORS = ("/", "\\")
 """A remote path may be written with either separator."""
 
-_FORBIDDEN_IN_SEGMENT = ("/", "\\", ":", "\x00")
+_FORBIDDEN_IN_SEGMENT = ("/", "\\", ":", "\x00")    # \x00 is ASCII 0 char
 """Characters the store refuses inside one path segment."""
 
 
@@ -140,10 +160,13 @@ def object_key(path: str, user: str) -> str:
     """Turn a remote object path and account into the cluster's partition key.
 
     ``a/b/file.txt`` for user ``jdoe`` becomes ``jdoe-a-b-file.txt``: the
-    separators turn into ``-`` and the account name goes in front.  The result
-    is checked against the same rules the data server's store applies -- every
-    ``-``-separated segment must be a usable directory name -- so an impossible
-    key is refused here, before anything is sent.
+    separators turn into ``-`` and the account name goes in front.  A ``-`` that
+    is part of a name rather than a separator -- ``home/notes-v2.txt`` -- is
+    written ``\\-``, so it can never read back as a separator and put two
+    different objects on one key.  The result is checked against the same rules
+    the data server's store applies -- every ``-``-separated segment of the key
+    must be a usable directory name -- so an impossible key is refused here,
+    before anything is sent.
 
     Raises :class:`ClientError` for a path or account that cannot become a key.
     """
@@ -152,7 +175,7 @@ def object_key(path: str, user: str) -> str:
     if not isinstance(user, str):
         raise ClientError(f"account name must be text, got {type(user).__name__}")
     account = _account(user)
-    return "-".join([account, *_segments(path)])
+    return "-".join(_escaped(part) for part in [account, *_segments(path)])
 
 
 def _segments(path: str) -> list[str]:
@@ -170,22 +193,34 @@ def _segments(path: str) -> list[str]:
 
 
 def _account(user: str) -> str:
-    """The account name as a key prefix, refusing one that cannot be a path."""
+    """The account name as a key part, refusing one that cannot be a path.
+
+    The whole name is one segment, dashes included: a key keeps a dash inside a
+    segment escaped, so ``john-doe`` becomes ``john\\-doe`` and does not read
+    back as two accounts.
+    """
     account = user.strip()
     if not account:
         raise ClientError("account name must not be blank")
-    for part in account.split("-"):
-        _check_segment(part, user)
+    _check_segment(account, user)
     return account
 
 
+def _escaped(part: str) -> str:
+    """``part`` as it is written in a key: a literal ``-`` becomes ``\\-``."""
+    return part.replace("-", "\\-")
+
+
 def _check_segment(segment: str, source: str) -> None:
-    """Refuse a segment the store could not turn into a directory name."""
-    if (
-        segment in ("", ".", "..")
-        or ":" in segment
-        or "\x00" in segment
-        or any(separator in segment for separator in _PATH_SEPARATORS)
+    """Refuse a segment the store could not turn into a directory name.
+
+    A segment that is empty, ``.`` or ``..`` would move the path somewhere else;
+    one holding any of :data:`_FORBIDDEN_IN_SEGMENT` -- a path separator, a drive
+    colon, a NUL -- is not a single directory name at all.  Either is refused
+    before the key is built.
+    """
+    if segment in ("", ".", "..") or any(
+        forbidden in segment for forbidden in _FORBIDDEN_IN_SEGMENT
     ):
         raise ClientError(f"{source!r} is not a usable object path")
 
@@ -323,35 +358,94 @@ class Client:
         ok_statuses: tuple[int, ...],
         data: bytes | None = None,
     ) -> dict[str, Any]:
-        """Send ``method`` to the fan until ``replicate_count`` servers accept.
+        """Reach ``replicate_count`` acknowledged servers, replica set first.
 
-        Walks the fan in order and stops the moment the quorum is reached, so a
-        healthy primary plus its secondaries settle it without touching the
-        handoff servers.  A server that cannot be reached is recorded and the
-        walk goes on -- that is what the later servers are for.
+        Two phases.  The replica set -- the first ``replicate_count`` servers of
+        the fan -- is sent ``method`` *at once*, so a write's latency is the
+        slowest copy rather than the sum of the copies.  Only if that leaves the
+        quorum short are the handoff servers walked, in fan order, stopping as
+        soon as the quorum is met.
+
+        A server that cannot be reached is recorded and the walk goes on -- that
+        is what the later servers are for.  ``acknowledged`` and ``failed`` come
+        back in fan order, so a report reads the same however the race finished.
         """
         quorum = lookup["replicate_count"]
-        acknowledged: list[str] = []
-        failed: list[dict[str, str]] = []
-        for server in lookup["servers"]:
-            if len(acknowledged) >= quorum:
+        servers = list(lookup["servers"])
+        outcomes = list(
+            zip(
+                servers[:quorum],
+                self._send_all(servers[:quorum], method, key, data, ok_statuses),
+            )
+        )
+        accepted = sum(1 for _, error in outcomes if error is None)
+        for server in servers[quorum:]:
+            if accepted >= quorum:
                 break
-            try:
-                status, _ = self._send(method, server, key, data=data)
-            except ClientError as exc:
-                failed.append({"server": server, "error": str(exc)})
-                continue
-            if status in ok_statuses:
-                acknowledged.append(server)
-            else:
-                failed.append({"server": server, "error": _reason(status)})
+            error = self._attempt(server, method, key, data, ok_statuses)
+            outcomes.append((server, error))
+            if error is None:
+                accepted += 1
+        acknowledged = [server for server, error in outcomes if error is None]
         return {
             "key": key,
             "quorum": quorum,
             "acknowledged": acknowledged,
-            "failed": failed,
+            "failed": [
+                {"server": server, "error": error}
+                for server, error in outcomes
+                if error is not None
+            ],
             "ok": len(acknowledged) >= quorum,
         }
+
+    def _send_all(
+        self,
+        servers: list[str],
+        method: str,
+        key: str,
+        data: bytes | None,
+        ok_statuses: tuple[int, ...],
+    ) -> list[str | None]:
+        """Send ``method`` to every server at once; the results keep fan order.
+
+        One thread per server: the replica set is the size of ``replicate_count``
+        and the requests share nothing, so the copies overlap instead of queueing
+        behind each other.  A server that never answers still costs its timeout,
+        but every timeout runs alongside the others rather than after them.
+
+        ``None`` means that server accepted the change; anything else is why it
+        did not.  ``pool.map`` yields in submission order, so the caller can zip
+        the results straight back onto ``servers``.
+        """
+        if not servers:
+            return []
+        if len(servers) == 1:
+            return [self._attempt(servers[0], method, key, data, ok_statuses)]
+        with ThreadPoolExecutor(max_workers=len(servers)) as pool:
+            return list(
+                pool.map(
+                    lambda server: self._attempt(
+                        server, method, key, data, ok_statuses
+                    ),
+                    servers,
+                )
+            )
+
+    def _attempt(
+        self,
+        server: str,
+        method: str,
+        key: str,
+        data: bytes | None,
+        ok_statuses: tuple[int, ...],
+    ) -> str | None:
+        """One write to one server: ``None`` if it accepted, else why it did not."""
+        try:
+            status, _ = self._send(method, server, key, data=data)
+        except ClientError as exc:
+            return str(exc)
+        return None if status in ok_statuses else _reason(status)
 
     # -- transport ----------------------------------------------------------
 

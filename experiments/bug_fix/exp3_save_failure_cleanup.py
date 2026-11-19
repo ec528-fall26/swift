@@ -43,9 +43,9 @@ Linux, upstream dependencies, and a writable temporary filesystem are required.
 The worker has a 90-second default deadline. See experiments/README.md.
 """
 
-import builtins
 import os
 import pickle
+import tempfile
 from unittest import mock
 
 from atomic_save_support import BuilderCase, ObservedFile, make_builder, run
@@ -68,13 +68,17 @@ class TestSaveFailureCleanup(BuilderCase):
             handle.flush()
             fail()
 
-        def observed_open(*args, **kwargs):
-            return ObservedFile(builtins.open(*args, **kwargs), before_flush=fail)
+        def observed_temporary(*args, **kwargs):
+            # save() creates its temporary file with NamedTemporaryFile, so
+            # wrap the real one and fail on its explicit flush.
+            return ObservedFile(tempfile.NamedTemporaryFile(*args, **kwargs),
+                                before_flush=fail)
 
         if stage == 'serialization':
             patch = mock.patch.object(self.module.pickle, 'dump', partial_dump)
         elif stage == 'flush':
-            patch = mock.patch.object(self.module, 'open', observed_open, create=True)
+            patch = mock.patch.object(self.module, 'NamedTemporaryFile',
+                                      observed_temporary, create=True)
         elif stage == 'file_fsync':
             patch = mock.patch.object(os, 'fsync', fail)
         else:

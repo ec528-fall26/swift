@@ -21,9 +21,10 @@ local Linux and the team's prepared LightSail instances:
   [Swift Light design document](docs/design-document-swift-light.md)
   to start the cluster and run the upload and download experiments.
 
-- **RingBuilder bug fix — `SwiftBugFix` instance:** Follow the
+- **RingBuilder and composite-builder bug fix — `SwiftBugFix` instance:** Follow the
   [bug-fix design document](docs/design-document-bug-fix.md)
-  to prepare the OpenStack Swift checkout and run experiments 0–4.
+  to prepare the OpenStack Swift checkout, run experiments 0–11, and run the
+  atomic-save unit tests.
 
 The bug-fix experiments run against the separate OpenStack Swift checkout;
 they do not require the Swift Light cluster.
@@ -35,6 +36,7 @@ they do not require the Swift Light cluster.
 | `docs/` | Design proposal and design document |
 | `slides/` | Demo slides (`demo-1.pdf`, `demo-2.pdf`, ...) |
 | `src/` | Source code |
+| `src/test/` | Unit tests (`client/`, `data/`, `proxy/`) and end-to-end tests (`service_integration_test/`) |
 | `experiments/` | Scripts that reproduce every result you claim |
 
 ## Reproducing our results

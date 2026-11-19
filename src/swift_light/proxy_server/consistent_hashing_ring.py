@@ -60,39 +60,91 @@ half-written ring in place of a good one.  ``load()`` validates what it read
 before handing back a ring, because the file is the one thing here that can be
 corrupt.
 
+Write modes
+-----------
+Every ring write comes in two flavours.  An *atomic* write (the default) is the
+one just described.  A *non-atomic* write flushes the JSON straight to the
+destination file -- opened, truncated, written, ``fsync`` -- with no temp file
+and no rename.  That is one file operation fewer, but an interruption leaves a
+half-written ring where a good one was, which is the failure the atomic write
+exists to prevent.  The mode is chosen when the cluster is deployed
+(``deploy.py up non_atomic``) and passed to ``build()`` / ``rebalance()``.  The
+one write that is deliberately always non-atomic is ``rebalance()``'s per-batch
+working copy: it is scratch, and the rename that installs it is the commit.
+
 ``rebalance()`` uses three files, all beside one another:
 
     ring.json            the layout the cluster is serving from right now
-    ring.json.temp       the ring after the step currently being taken
+    ring.json.temp       the ring after the batch currently being taken
     balanced_ring.json   the finished target
 
 Rebalancing
 -----------
 ``rebalance()`` is called after a data server joins or leaves.  It does not
 move placement all at once, because every change has to move real files.  The
-finished target is built and flushed first, then taken one vnode point at a
-time.  Each step does four things, and the order is the whole point:
+finished target is built and flushed first, then taken a batch of
+``DEFAULT_FLUSH_EVERY`` (50) vnode points at a time.  Each batch does four
+things, and the order is the whole point:
 
-1. insert or drop *one* vnode point in ``ring.json.temp`` and flush it, so the
-   intention is on disk before any file moves;
+1. insert or drop the batch's vnode points in ``ring.json.temp`` and flush it
+   *once*, so the intention is on disk before any file moves;
 2. move the files whose placement changed -- ``write()`` to the server taking
    them on, ``write_handoff()`` to the one giving them up;
 3. rename ``ring.json.temp`` over ``ring.json`` -- the commit point;
 4. flush the directory, so the rename survives a crash.
 
+Only ``ring.json`` has to be impossible to tear, and step 3 is what installs it,
+so step 1's flush is a plain write to a scratch file: no second temp file and no
+second rename.  A crash while that write is half-done leaves ``ring.json``
+untouched, which is exactly the state a redo resumes from.
+
+A batch costs one ring write, not one per point.  The ring is the whole fan
+table, tens of kilobytes, so flushing it after every single point made a
+membership change 100 ring writes -- and those writes, not the file moves, were
+what the rebalance spent its time on.  At 50 points per flush a 100-point
+membership change costs two; a larger one costs proportionally more.
+
 ``ring.json`` therefore only ever describes a layout whose files have already
 been moved, and it is what a rebooting server loads.  A crash anywhere earlier
-leaves ``ring.json`` untouched, so the interrupted step is simply redone; file
+leaves ``ring.json`` untouched, so the interrupted batch is simply redone; file
 moves are idempotent, so redoing them is safe.
 
 ``balanced_ring.json`` is the crash marker: it exists while a rebalance is in
-flight and is removed once the last step commits.  Its presence is how a reboot
+flight and is removed once the last batch commits.  Its presence is how a reboot
 tells "interrupted" from "settled", and ``rebalance()`` resumes from it.
 
-A step's worth of movement is not only the arc that changed owner.  Inserting a
-point also puts the arriving server into other arcs' fan lists, as a secondary
+A batch's worth of movement is not only the arcs that changed owner.  Inserting
+a point also puts the arriving server into other arcs' fan lists, as a secondary
 for the arcs just after its point, so those replicas have to be settled too --
-otherwise the ring would claim a copy that was never written.
+otherwise the ring would claim a copy that was never written.  Comparing the
+ring before the batch with the ring after it settles exactly those arcs.
+
+Locking
+-------
+A file being copied must not change underneath the copy.  When the data server
+a rebalance drives offers ``lock(*nodes)``,
+:func:`_move_files` makes each arc's transfer while the source and every node
+gaining or losing a copy hold that node's write lock; a client write to either
+side is refused for the duration.  The HTTP implementation
+(:class:`~swift_light.data_server.remote.RemoteDataServer`) takes the locks in
+a fixed order -- so two coordinators cannot deadlock -- and leases them, so a
+coordinator that dies mid-migration does not leave a node refusing writes.
+
+The lock is optional, not part of the :class:`DataServer` protocol: a ring-only
+test object has nothing to protect, and the rebalance simply does not lock when
+the object offers no ``lock``.
+
+Logging
+-------
+``rebalance()`` logs two things at ``INFO``: the membership change that caused
+it ("data server(s) joined / left the cluster") and, once every batch has
+committed, its completion ("data migration complete", with the vnode points
+applied, the files moved, and the batch count).  A run that resumes an
+interrupted migration says so instead of repeating the membership line, and a
+call that finds the ring already settled logs at ``DEBUG`` only.
+
+This module installs no handler and sets no level: an application decides
+whether to show those lines (``deploy.py`` configures ``INFO`` when it runs).
 
 Usage
 -----
@@ -147,10 +199,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from bisect import bisect_right
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol, runtime_checkable
 
@@ -160,6 +214,7 @@ __all__ = [
     "RingAlreadyBuiltError",
     "RING_SIZE",
     "DEFAULT_VNODE_COUNT",
+    "DEFAULT_FLUSH_EVERY",
     "DEFAULT_RING_FILENAME",
 ]
 
@@ -168,6 +223,14 @@ RING_SIZE = 2**16
 
 DEFAULT_VNODE_COUNT = 100
 """Default number of virtual nodes each data server contributes."""
+
+DEFAULT_FLUSH_EVERY = 50
+"""Vnode points a rebalance applies between two ring flushes.
+
+The ring is the whole fan table, so writing it costs far more than moving the
+files for one point.  A batch of 50 points per flush turns a 100-point
+membership change into two ring writes instead of a hundred.
+"""
 
 DEFAULT_HASH_ALGORITHM = "sha1"
 DEFAULT_NODE_PREFIX = "node_"
@@ -184,6 +247,13 @@ _TEMP_SUFFIX = ".tmp"
 _Point = tuple[int, str]
 _Edit = tuple[str, int, str]
 
+_log = logging.getLogger(__name__)
+"""Where membership changes and data-migration progress are reported.
+
+No handler is installed here: a library leaves that to the application
+(``deploy.py`` configures INFO on the root logger when it runs).
+"""
+
 
 class RingAlreadyBuiltError(FileExistsError):
     """Raised when a ring is built where a ring already exists.
@@ -197,9 +267,19 @@ class RingAlreadyBuiltError(FileExistsError):
 @runtime_checkable
 class DataServer(Protocol):
     """The part of a data server that :meth:`ConsistentHashingRing.rebalance`
-    drives.  Not implemented yet -- this is the contract to build against.
+    drives.
 
     Slots are half-open: a file belongs to the arc ``[start_slot, end_slot)``.
+    :class:`~swift_light.data_server.remote.RemoteDataServer` implements this
+    over HTTP against live data servers; a test object can implement it in a
+    few lines.
+
+    A rebalance also looks for an optional ``lock(*nodes)`` context manager.
+    When one is offered, each arc's transfer is made while the source and every
+    node gaining or losing a copy hold that lock, so a client cannot write to
+    either side of the copy.  It is deliberately not part of this protocol: an
+    in-memory test object has nothing to lock, and ``rebalance`` simply does not
+    lock when the object does not offer one.
     """
 
     def list_files(self, node: str, start_slot: int, end_slot: int) -> Iterable[str]:
@@ -293,6 +373,7 @@ class ConsistentHashingRing:
         node_prefix: str = DEFAULT_NODE_PREFIX,
         nodes: Iterable[str] | None = None,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Build the cluster's ring, once, and flush it to disk.
 
@@ -305,7 +386,8 @@ class ConsistentHashingRing:
 
         Defaults to ``ring.json`` next to this module.  ``nodes`` overrides the
         generated ``<node_prefix>0, <node_prefix>1, ...`` names, which is how a
-        caller pins placement to a known cluster.
+        caller pins placement to a known cluster.  ``atomic=False`` flushes the
+        ring straight to ``path`` instead of through a temp file and a rename.
         """
         ring = cls(
             tot_node_count,
@@ -331,7 +413,7 @@ class ConsistentHashingRing:
             members = tuple(nodes)
         ring._install(members)
 
-        ring.save(target)
+        ring.save(target, atomic=atomic)
         return ring
 
     # -- membership ---------------------------------------------------------
@@ -343,6 +425,7 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Add ``node`` to the cluster and rebalance onto it.
 
@@ -356,10 +439,10 @@ class ConsistentHashingRing:
         cluster exactly as it was.  There is no settled no-op here: a new server
         always owns points, so there is always something to move.
         """
-        members = cls._settled_members(path, data)
+        members = cls._settled_members(path, data, atomic=atomic)
         if node in members:
             raise ValueError(f"{node!r} is already a member of the cluster")
-        return cls.rebalance((*members, node), data=data, path=path)
+        return cls.rebalance((*members, node), data=data, path=path, atomic=atomic)
 
     @classmethod
     def remove_node(
@@ -368,6 +451,7 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
         """Remove ``node`` from the cluster and rebalance off it.
 
@@ -379,11 +463,14 @@ class ConsistentHashingRing:
         ``replicate_count``.  Both are caught while the target is built, which
         is before the first file moves, so the cluster survives the mistake.
         """
-        members = cls._settled_members(path, data)
+        members = cls._settled_members(path, data, atomic=atomic)
         if node not in members:
             raise ValueError(f"{node!r} is not a member of the cluster")
         return cls.rebalance(
-            tuple(name for name in members if name != node), data=data, path=path
+            tuple(name for name in members if name != node),
+            data=data,
+            path=path,
+            atomic=atomic,
         )
 
     # -- rebalancing --------------------------------------------------------
@@ -395,22 +482,35 @@ class ConsistentHashingRing:
         *,
         data: DataServer,
         path: str | os.PathLike[str] | None = None,
+        atomic: bool = True,
     ) -> "ConsistentHashingRing":
-        """Move the cluster to ``nodes``, one vnode point at a time.
+        """Move the cluster to ``nodes``, a batch of vnode points at a time.
 
         Called after a data server joins or leaves.  The target is built and
-        flushed first, then taken one step at a time -- insert or drop a single
-        vnode point, move the files that disturbs, commit by renaming.  See the
-        module docstring for the ordering and why it is safe.
+        flushed first, then taken ``DEFAULT_FLUSH_EVERY`` points at a time --
+        insert or drop the batch's vnode points, move the files that disturbs,
+        commit.  See the module docstring for the ordering and why it is safe,
+        and for why the points are batched rather than flushed one by one.
 
         Safe to call again after a crash: it resumes from wherever ``ring.json``
         got to, and returns immediately when there is nothing left to move.
         Call it again on reboot even if you are not sure -- a settled cluster
         costs one file check.
 
+        ``atomic`` picks how each batch's ring reaches the disk.  Atomic batches
+        write ``ring.json.temp``, move the files, then rename it over
+        ``ring.json`` -- the rename is the commit point, and it is the only step
+        that has to be atomic, so the temp file itself is written straight to
+        its own scratch file rather than through a second temp-and-rename.
+        Non-atomic batches move the files and then flush the new ring straight
+        to ``ring.json``: no temp file, no commit point, so an interrupted write
+        leaves a truncated ring.
+
         ``data`` supplies ``list_files`` / ``write`` / ``write_handoff``; see
         :class:`DataServer`.
         """
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
         members = tuple(nodes)
         if not isinstance(data, DataServer):
             raise TypeError(
@@ -434,7 +534,17 @@ class ConsistentHashingRing:
                     f"{balanced_path.name} targets {len(balanced._nodes)} servers, "
                     f"not the {len(members)} asked for; finish or remove it first"
                 )
+            _log.info(
+                "resuming an interrupted data migration towards %d data servers "
+                "(%d vnode points in place so far)",
+                len(members),
+                len(current._slots),
+            )
         elif _is_settled(current, members):
+            _log.debug(
+                "the ring already describes these %d data servers; nothing to migrate",
+                len(members),
+            )
             return current
         else:
             balanced = cls.build(
@@ -445,19 +555,59 @@ class ConsistentHashingRing:
                 hash_algorithm=current.hash_algorithm,
                 nodes=members,
                 path=balanced_path,
+                atomic=atomic,
             )
+            joined = [name for name in members if name not in current._nodes]
+            left = [name for name in current._nodes if name not in members]
+            if joined:
+                _log.info(
+                    "data server(s) joined the cluster: %s (%d -> %d data servers)",
+                    ", ".join(joined),
+                    len(current._nodes),
+                    len(members),
+                )
+            if left:
+                _log.info(
+                    "data server(s) left the cluster: %s (%d -> %d data servers)",
+                    ", ".join(left),
+                    len(current._nodes),
+                    len(members),
+                )
 
-        for edit in _plan_steps(current, balanced):
-            following = current._after_edit(edit, balanced._nodes)
-            following.save(temp_path)
-            _move_files(current, following, data)
-            _install_prepared(temp_path, live_path)
+        moved = 0
+        applied = 0
+        batches = 0
+        for batch in _batches(_plan_steps(current, balanced), DEFAULT_FLUSH_EVERY):
+            following = current._after_edits(batch, balanced._nodes)
+            if atomic:
+                following.save(temp_path, atomic=False)
+                moved += _move_files(current, following, data)
+                _install_prepared(temp_path, live_path)
+            else:
+                # No temp file and no rename: the files move first, then the
+                # new layout is flushed over the live ring in place.
+                moved += _move_files(current, following, data)
+                following.save(live_path, atomic=False)
+            applied += len(batch)
+            batches += 1
             current = following
 
         if not _is_settled(current, members):
             raise RuntimeError(
                 f"rebalance stalled with {len(current._slots)} of "
                 f"{len(members) * current.vnode_count} vnode points in place"
+            )
+
+        if applied:
+            _log.info(
+                "data migration complete: %d vnode points applied, %d files moved "
+                "in %d batch(es); cluster now has %d data servers, "
+                "replicate_count=%d",
+                applied,
+                moved,
+                batches,
+                len(current._nodes),
+                current.replicate_count,
             )
 
         if balanced_path.exists():
@@ -582,13 +732,28 @@ class ConsistentHashingRing:
         ring.validate(complete=complete)
         return ring
 
-    def save(self, path: str | os.PathLike[str] | None = None) -> Path:
-        """Atomically write the ring to ``path`` and return where it landed.
+    def save(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        atomic: bool = True,
+    ) -> Path:
+        """Write the ring to ``path`` and return where it landed.
 
-        Defaults to ``ring.json`` next to this module.
+        Defaults to ``ring.json`` next to this module.  Atomic by default --
+        temp file, flush, rename, flush the directory -- so a crash never leaves
+        a half-written ring.  ``atomic=False`` opens ``path`` directly, truncates
+        it, writes, and flushes: faster, but an interrupted write leaves the
+        ring half-written.
         """
+        if not isinstance(atomic, bool):
+            raise TypeError(f"atomic must be a bool, got {type(atomic).__name__}")
         target = _resolve_path(path)
-        _atomic_write_text(target, json.dumps(self.to_dict(), indent=2) + "\n")
+        text = json.dumps(self.to_dict(), indent=2) + "\n"
+        if atomic:
+            _atomic_write_text(target, text)
+        else:
+            _write_text_direct(target, text)
         return target
 
     @classmethod
@@ -737,6 +902,8 @@ class ConsistentHashingRing:
         cls,
         path: str | os.PathLike[str] | None,
         data: DataServer,
+        *,
+        atomic: bool = True,
     ) -> tuple[str, ...]:
         """Node names of the settled cluster, finishing an interrupted rebalance.
 
@@ -754,26 +921,32 @@ class ConsistentHashingRing:
         balanced_path = _balanced_path(live_path)
         if balanced_path.is_file():
             pending = cls.load(balanced_path)
-            return cls.rebalance(pending._nodes, data=data, path=path)._nodes
+            return cls.rebalance(
+                pending._nodes, data=data, path=path, atomic=atomic
+            )._nodes
         return cls.load(live_path)._nodes
 
-    def _after_edit(
-        self, edit: _Edit, target_order: tuple[str, ...]
+    def _after_edits(
+        self, edits: Iterable[_Edit], target_order: tuple[str, ...]
     ) -> "ConsistentHashingRing":
-        """A copy of this ring with one vnode point inserted or dropped.
+        """A copy of this ring with a batch of vnode points inserted or dropped.
+
+        Taking the whole batch in one go is what lets the rebalance flush the
+        ring once per batch instead of once per point: the fan areas are derived
+        once for the batch, not once per edit.
 
         ``target_order`` is the membership being rebalanced towards; it fixes
-        the order servers are listed in, so the last step lands exactly on the
+        the order servers are listed in, so the last batch lands exactly on the
         target rather than on a permutation of it.
         """
-        kind, slot, node = edit
         points = list(zip(self._slots, self._point_nodes))
-        if kind == "insert":
-            points.append((slot, node))
-        elif kind == "drop":
-            points.remove((slot, node))
-        else:
-            raise ValueError(f"unknown rebalance edit {kind!r}")
+        for kind, slot, node in edits:
+            if kind == "insert":
+                points.append((slot, node))
+            elif kind == "drop":
+                points.remove((slot, node))
+            else:
+                raise ValueError(f"unknown rebalance edit {kind!r}")
         points.sort()
 
         present = {name for _, name in points}
@@ -886,6 +1059,16 @@ def _plan_steps(
     ]
 
 
+def _batches(edits: list[_Edit], size: int) -> Iterator[list[_Edit]]:
+    """Cut a rebalance plan into consecutive groups of at most ``size`` edits.
+
+    Each group is applied and then flushed as one, so the ring is written
+    ``ceil(len(edits) / size)`` times instead of once per point.
+    """
+    for start in range(0, len(edits), size):
+        yield edits[start : start + size]
+
+
 def _arc_ranges(bounds: list[int], ring_size: int) -> list[list[tuple[int, int]]]:
     """Half-open slot ranges for the arcs cut by ``bounds``, as pieces.
 
@@ -934,19 +1117,30 @@ def _changed_arcs(
 def _move_files(
     before: ConsistentHashingRing, after: ConsistentHashingRing, data: DataServer
 ) -> int:
-    """Move every file whose placement changed, and count them."""
+    """Move every file whose placement changed, and count them.
+
+    When ``data`` offers a ``lock(*nodes)`` context manager (the HTTP adapter
+    does), one arc's transfer holds it for the source and every node gaining or
+    losing a copy.  A client write to either side of the copy is then refused
+    until the arc is done, instead of landing on a file that is being moved.
+    Locking is optional: a ring-only test object has nothing to protect, and
+    ``getattr`` keeps the protocol unchanged for it.
+    """
     moved = 0
+    lock = getattr(data, "lock", None)
     for pieces, old_set, joined, left in _changed_arcs(before, after):
         source = old_set[0]  # the arc's old primary, which held these files
-        for start, end in pieces:
-            if start >= end:
-                continue
-            for key in data.list_files(source, start, end):
-                for node in joined:
-                    data.write(key, node)
-                for node in left:
-                    data.write_handoff(key, node)
-                moved += 1
+        participants = tuple(dict.fromkeys((source, *joined, *left)))
+        with (lock(*participants) if lock is not None else nullcontext()):
+            for start, end in pieces:
+                if start >= end:
+                    continue
+                for key in data.list_files(source, start, end):
+                    for node in joined:
+                        data.write(key, node)
+                    for node in left:
+                        data.write_handoff(key, node)
+                    moved += 1
     return moved
 
 
@@ -963,7 +1157,7 @@ def _resolve_path(path: str | os.PathLike[str] | None) -> Path:
 
 
 def _temp_path(path: Path) -> Path:
-    """The working file for the step in flight."""
+    """The working file for the batch in flight (scratch; never served)."""
     return path.with_name(path.name + ".temp")
 
 
@@ -1038,4 +1232,20 @@ def _atomic_write_text(target: Path, text: str) -> None:
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+    _fsync_directory(directory)
+
+
+def _write_text_direct(target: Path, text: str) -> None:
+    """Write ``text`` straight to ``target`` and flush it -- no rename.
+
+    The destination is truncated before the text is written, so an interruption
+    leaves a half-written ring where a complete one was.  That is the trade a
+    non-atomic write makes: no temp file, no directory entry swap, one file.
+    """
+    directory = target.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     _fsync_directory(directory)

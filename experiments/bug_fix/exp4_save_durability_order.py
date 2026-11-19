@@ -49,6 +49,7 @@ import os
 from pathlib import Path
 import pickle
 import stat
+import tempfile
 from unittest import mock
 
 from atomic_save_support import BuilderCase, ObservedFile, run
@@ -60,18 +61,29 @@ class TestSaveDurabilityOrder(BuilderCase):
         expected = self.builder.to_dict()
         events, handles, candidates = [], [], []
         real_dump, real_sync, real_rename = pickle.dump, os.fsync, os.rename
+        real_temporary = tempfile.NamedTemporaryFile
 
-        def observed_open(path, *args, **kwargs):
-            candidate = Path(path).resolve()
+        def observed_temporary(*args, **kwargs):
+            # save() creates its temporary file with NamedTemporaryFile; wrap
+            # the real one to observe the explicit flush and the close.
+            handle = real_temporary(*args, **kwargs)
+            candidate = Path(handle.name).resolve()
             self.assertNotEqual(self.path.resolve(), candidate,
-                                'save opened the live builder for writing')
+                                'save wrote to the live builder')
             self.assertEqual(self.path.parent.resolve(), candidate.parent)
-            handle = builtins.open(path, *args, **kwargs)
             handles.append(handle)
             candidates.append(candidate)
             return ObservedFile(
                 handle, after_flush=lambda: events.append('flush'),
                 after_close=lambda: events.append('close'))
+
+        def observed_open(path, *args, **kwargs):
+            # Writing the live builder in place is the bug being fixed.
+            mode = args[0] if args else kwargs.get('mode', 'r')
+            if any(flag in mode for flag in 'wax+'):
+                self.assertNotEqual(self.path.resolve(), Path(path).resolve(),
+                                    'save opened the live builder for writing')
+            return builtins.open(path, *args, **kwargs)
 
         def observed_dump(obj, handle, *args, **kwargs):
             self.assert_previous()
@@ -105,7 +117,9 @@ class TestSaveDurabilityOrder(BuilderCase):
             events.append('rename')
             return result
 
-        with mock.patch.object(self.module, 'open', observed_open, create=True), \
+        with mock.patch.object(self.module, 'NamedTemporaryFile',
+                               observed_temporary, create=True), \
+                mock.patch.object(self.module, 'open', observed_open, create=True), \
                 mock.patch.object(self.module.pickle, 'dump', observed_dump), \
                 mock.patch.object(os, 'fsync', observed_sync), \
                 mock.patch.object(os, 'rename', observed_rename):

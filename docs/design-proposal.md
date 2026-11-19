@@ -179,7 +179,7 @@ failure fails the pipeline:
 | Metric | Baseline |
 | --- | --- |
 | p95 write latency | ≤ 50 ms |
-| Sustained acknowledged writes | ≥ 1,000 writes/s |
+| Sustained acknowledged writes | ≥ 1,000 writes |
 | p95 read latency | ≤ 20 ms |
 
 A green pipeline with a failed or missing benchmark run does not satisfy the

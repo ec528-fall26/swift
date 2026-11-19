@@ -192,6 +192,17 @@ class Heartbeat:
         self._history[server] = message
         return message
 
+    def forget(self, server: str) -> None:
+        """Drop everything recorded for ``server`` -- it is no longer a member.
+
+        A re-probe only covers the ring's current nodes, so without this a
+        server removed by a membership change would stay in :meth:`get_status`
+        forever, reported as failed.
+        """
+        self._status.pop(server, None)
+        self._history.pop(server, None)
+        self._checked_at.pop(server, None)
+
     def is_alive(self, server: str) -> bool:
         """Whether ``server`` counts as alive right now.
 
