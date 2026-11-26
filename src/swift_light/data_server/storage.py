@@ -66,11 +66,9 @@ that cannot be a safe path -- empty, ``.``/``..``, a path separator, an escape
 that does not hide a dash -- raises
 :class:`InvalidKeyError`.  Writes go through the same atomic temp-file-and-rename
 step :meth:`DataServerConfig.save` uses, so a crash never leaves a half-written
-file.  A delete is atomic too -- the file is renamed to a throwaway name first --
-and the empty directory branch it leaves behind is then pruned up to the store
-root.
-
-Handoff
+    file.  A delete is a plain unlink in both write modes -- there are no bytes to
+    leave half-written, so it does not pay for a temp file and a rename -- and the
+    empty directory branch it leaves behind is then pruned up to the store root.
 -------
 When a proxy cannot reach the node that owns a key -- the primary, or a
 secondary -- it asks a substitute server to hold the object until the owner
@@ -266,13 +264,13 @@ class DataStore:
     ``jdoe/home/notes-v2.txt``.  The key is turned into a path under
     :attr:`root` and the bytes are read or written there.
 
-    In atomic mode (the default) writes and deletes are crash-safe -- the same
+    In atomic mode (the default) writes are crash-safe -- the same
     temp-file-and-rename step :meth:`DataServerConfig.save` uses -- so a crash
-    never leaves a half-written or half-deleted file.  In non-atomic mode the
-    bytes are written straight to the destination and flushed, with no temp file
-    and no rename.  A read for a key that is not held raises
-    :class:`FileNotFoundError` rather than returning nothing, and a delete prunes
-    any directory branch the file alone kept alive.
+    never leaves a half-written file.  In non-atomic mode the bytes are written
+    straight to the destination and flushed, with no temp file and no rename.  A
+    delete is a plain unlink in both modes.  A read for a key that is not held
+    raises :class:`FileNotFoundError` rather than returning nothing, and a delete
+    prunes any directory branch the file alone kept alive.
     """
 
     __slots__ = ("_root", "_atomic")
@@ -299,7 +297,10 @@ class DataStore:
 
     @property
     def atomic(self) -> bool:
-        """Whether writes and deletes go through a temp file and a rename."""
+        """Whether writes go through a temp file and a rename.
+
+        Deletes are a plain unlink in both modes.
+        """
         return self._atomic
 
     def path_for(self, key: str) -> Path:
@@ -337,18 +338,18 @@ class DataStore:
         return path
 
     def delete(self, key: str) -> Path:
-        """Atomically remove the file for ``key``; prune the empty branch.
+        """Remove the file for ``key``; prune the empty branch.
 
-        Raises :class:`FileNotFoundError` if no file is stored for ``key``.  In
-        atomic mode the file is renamed out of the way before it is unlinked
-        (see :func:`_atomic_delete`); in non-atomic mode it is unlinked in
-        place.  Either way any directory that only this file kept alive is then
-        removed, up to :attr:`root`.
+        Raises :class:`FileNotFoundError` if no file is stored for ``key``.
+        The file is unlinked in place in **both** write modes: a delete has no
+        bytes that could be left half-written, so it does not pay for the
+        temp-file-and-rename step a write uses.  Any directory that only this
+        file kept alive is then removed, up to :attr:`root`.
         """
         path = self.path_for(key)
         if not path.is_file():
             raise FileNotFoundError(f"no file for partition key {key!r}")
-        _remove_file(path, atomic=self._atomic)
+        _remove_file(path)
         _remove_empty_branches(path.parent, self._root)
         return path
 
@@ -478,16 +479,17 @@ class DataStore:
     def clear_handoff(self, key: str, from_node: str) -> Path:
         """Remove a handoff once it has been applied or delivered.
 
-        Like :meth:`delete`, but in the handoff tree: the entry is removed (in
-        the store's configured mode) and the empty branch pruned.  Raises
-        :class:`FileNotFoundError` if nothing is held for ``key``.
+        Like :meth:`delete`, but in the handoff tree: the entry is unlinked in
+        place (deletes do not depend on the write mode) and the empty branch
+        pruned.  Raises :class:`FileNotFoundError` if nothing is held for
+        ``key``.
         """
         path = self.handoff_path_for(key, from_node)
         if not path.is_file():
             raise FileNotFoundError(
                 f"no handoff for partition key {key!r} from {from_node!r}"
             )
-        _remove_file(path, atomic=self._atomic)
+        _remove_file(path)
         _remove_empty_branches(path.parent, self._root)
         return path
 
@@ -659,16 +661,14 @@ def _write_bytes_direct(target: Path, data: bytes) -> None:
     _fsync_directory(directory)
 
 
-def _remove_file(target: Path, *, atomic: bool) -> None:
-    """Remove ``target`` in the mode the store was configured with.
+def _remove_file(target: Path) -> None:
+    """Unlink ``target`` in place and flush the directory.
 
-    ``atomic`` renames the file out of the way before unlinking it (see
-    :func:`_atomic_delete`); otherwise it is unlinked in place and the directory
-    flushed.
+    Deletes are the same in both write modes.  A write needs the
+    temp-file-and-rename step because an interruption could leave half the new
+    bytes in place of the old; an unlink has no such half state -- the file is
+    either there or gone -- so paying for a tombstone rename would buy nothing.
     """
-    if atomic:
-        _atomic_delete(target)
-        return
     target.unlink()
     _fsync_directory(target.parent)
 
@@ -696,28 +696,6 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
-    _fsync_directory(directory)
-
-
-def _atomic_delete(target: Path) -> None:
-    """Remove ``target`` so a reader sees it either fully present or gone.
-
-    The file is renamed to a unique throwaway name in the *same directory* -- an
-    atomic step, so the file disappears from its key at once -- the directory is
-    flushed, and only then is the renamed file unlinked.  A crash in between
-    leaves an unreachable temp file, never a half-deleted file.
-    """
-    directory = target.parent
-    descriptor, tombstone_name = tempfile.mkstemp(
-        prefix=target.name + ".", suffix=_TEMP_SUFFIX, dir=str(directory)
-    )
-    os.close(descriptor)
-    tombstone = Path(tombstone_name)
-    try:
-        os.replace(target, tombstone)
-        _fsync_directory(directory)
-    finally:
-        tombstone.unlink(missing_ok=True)
     _fsync_directory(directory)
 
 
