@@ -528,9 +528,10 @@ p50/p95/p99 and cases/second; the ring writes and the cost of one; and
 `every case succeeded`, with exit `0`. The std dev column is the sample
 standard deviation of the per-case times, so a gap between the two modes is
 only worth quoting when it is larger than that spread. Atomic mode should read
-slower in every row. For scale, one 200-case pair on the development machine
-put atomic about 10% above non-atomic per file write, 35% per delete, and
-15-23% per membership change -- a smoke-test comparison, not a result to quote.
+slower in every row except deletes, which are a plain unlink in both modes.
+For scale, one 200-case pair on the development machine put atomic about 10%
+above non-atomic per file write and 15-23% per membership change, with the
+delete row level -- a smoke-test comparison, not a result to quote.
 
 Experiment 0 needs no input files and starts and stops its own cluster;
 experiments 1 and 2 below use `SwiftLightFiles/Hello.txt` and the object path
@@ -676,3 +677,56 @@ acknowledged writes, is not measured here: it needs concurrent load.
 timing table with a `PASS` per row, `Ran 2 tests`, `OK`, `[exp5] OK`, and
 `RESULT: PASS`, with exit `0`. Exit `1` means a p95 went over budget or a case
 failed, and `77` means the suite could not be attempted.
+
+### Experiment 6: membership changes that move real objects
+
+**Claim tested:** a rebalance's cost is the object copies, not the ring writes --
+so what atomic mode adds to a membership change is not measurable end to end.
+
+```bash
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp6_migration_overhead.py --mode non_atomic --json non_atomic.json
+python3 src/swift_light/deploy.py down
+
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp6_migration_overhead.py --mode atomic --json atomic.json
+python3 src/swift_light/deploy.py down
+```
+
+Deploy the cluster in the mode `--mode` names, run the experiment, then
+redeploy in the other mode and run it again. All 30 cases (the default) are
+membership changes -- 15 joins and 15 leaves, alternating -- and each one is a
+real rebalance: the arriving server is a real `DataHTTPServer` this script
+starts on a fixed port (`--join-port`, 9100 by default), the copies are real
+HTTP between real stores, and the ring is churned on a private copy
+(`bench_ring.json`) so the deployed ring keeps serving the cluster. Objects to
+move are seeded through the shipped client at fixed keys before anything is
+timed and deleted afterwards. Do not push to the cluster while it runs: a
+migration holds the write lock on every node it touches.
+
+The port is fixed because the ring hashes the node's URL: an OS-picked port
+would move a different number of objects on every run. If 9100 is taken, pass
+`--join-port PORT` with a free port, and the same value to both modes.
+
+A change moves every object in the arcs it disturbs, not only the ones this
+script seeds, so a cluster still holding earlier runs' objects reports more
+copies per change. Both modes should report the same copy count for the same
+cluster contents. `--cases 10 --objects 20` is a few-minute smoke test.
+
+**Runtime:** about 10 minutes per mode at the defaults on the development
+machine: one change with ~100 objects on each node takes about 18-20 s, because
+~50 arcs each cost a listing, the copies and a lock round trip over HTTP.
+
+**Expected result:** the two-row table (cases, failed, seconds, ms/case, std
+dev, p50/p95/p99, cases/s), a `data movement` line with the objects copied and
+released per change, a `ring saves` line (total, ms per change, ms per ring
+write), and `every case succeeded`, with exit `0`.
+
+The `ring saves` line is what the write mode costs inside a case. In atomic
+mode a batch writes `ring.json.temp` on a background thread while the copies
+run, so only the rename that installs it is counted; the target write is not
+overlapped with anything and is counted in full. In non-atomic mode every write
+happens after the copies and is counted whole. One join and one leave on the
+development machine read 5.9 ms per change in atomic mode against 10.4 in
+non-atomic, out of 16-17 s per case -- the copies are what a membership change
+costs.
