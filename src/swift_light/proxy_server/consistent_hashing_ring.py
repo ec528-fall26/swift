@@ -83,20 +83,27 @@ Rebalancing
 ``rebalance()`` is called after a data server joins or leaves.  It does not
 move placement all at once, because every change has to move real files.  The
 finished target is built and flushed first, then taken a batch of
-``DEFAULT_FLUSH_EVERY`` (50) vnode points at a time.  Each batch does four
+``DEFAULT_FLUSH_EVERY`` (50) vnode points at a time.  Each batch does three
 things, and the order is the whole point:
 
-1. insert or drop the batch's vnode points in ``ring.json.temp`` and flush it
-   *once*, so the intention is on disk before any file moves;
-2. move the files whose placement changed -- ``write()`` to the server taking
+1. insert or drop the batch's vnode points in ``ring.json.temp`` *while* the
+   files whose placement changed are moved -- ``write()`` to the server taking
    them on, ``write_handoff()`` to the one giving them up;
-3. rename ``ring.json.temp`` over ``ring.json`` -- the commit point;
-4. flush the directory, so the rename survives a crash.
+2. rename ``ring.json.temp`` over ``ring.json`` once the files are in place --
+   the commit point;
+3. flush the directory, so the rename survives a crash.
 
-Only ``ring.json`` has to be impossible to tear, and step 3 is what installs it,
+Only ``ring.json`` has to be impossible to tear, and step 2 is what installs it,
 so step 1's flush is a plain write to a scratch file: no second temp file and no
 second rename.  A crash while that write is half-done leaves ``ring.json``
 untouched, which is exactly the state a redo resumes from.
+
+Because the temp file is scratch -- nothing reads it for recovery -- it does not
+have to be complete before the file moves start, only before the rename.  So the
+batch starts the flush on a background thread and joins it at step 2: the ring
+write is paid while the network is busy, and the only ring work left after the
+migration is the rename itself.  The write is small (tens of kilobytes) but it
+is a serialize plus an fsync, which is the same order as one object's save.
 
 A batch costs one ring write, not one per point.  The ring is the whole fan
 table, tens of kilobytes, so flushing it after every single point made a
@@ -202,9 +209,10 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from bisect import bisect_right
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol, runtime_checkable
 
@@ -498,10 +506,13 @@ class ConsistentHashingRing:
         costs one file check.
 
         ``atomic`` picks how each batch's ring reaches the disk.  Atomic batches
-        write ``ring.json.temp``, move the files, then rename it over
-        ``ring.json`` -- the rename is the commit point, and it is the only step
-        that has to be atomic, so the temp file itself is written straight to
-        its own scratch file rather than through a second temp-and-rename.
+        write ``ring.json.temp`` on a background thread while the files move,
+        then rename it over ``ring.json`` -- the rename is the commit point, and
+        it is the only step that has to be atomic, so the temp file itself is
+        written straight to its own scratch file rather than through a second
+        temp-and-rename.  Overlapping the write with the migration leaves only
+        the rename on the critical path; the scratch file is not read for
+        recovery, so it may be half-written while the files are moving.
         Non-atomic batches move the files and then flush the new ring straight
         to ``ring.json``: no temp file, no commit point, so an interrupted write
         leaves a truncated ring.
@@ -580,8 +591,10 @@ class ConsistentHashingRing:
         for batch in _batches(_plan_steps(current, balanced), DEFAULT_FLUSH_EVERY):
             following = current._after_edits(batch, balanced._nodes)
             if atomic:
-                following.save(temp_path, atomic=False)
-                moved += _move_files(current, following, data)
+                # The scratch ring is written while the files move; only the
+                # rename that installs it is left once the migration is done.
+                with _temp_write_in_background(following, temp_path):
+                    moved += _move_files(current, following, data)
                 _install_prepared(temp_path, live_path)
             else:
                 # No temp file and no rename: the files move first, then the
@@ -1174,6 +1187,42 @@ def _install_prepared(prepared: Path, target: Path) -> None:
     """
     os.replace(prepared, target)
     _fsync_directory(target.parent)
+
+
+@contextmanager
+def _temp_write_in_background(
+    ring: ConsistentHashingRing, path: Path
+) -> Iterator[None]:
+    """Write a batch's scratch ring file while the block moves the files.
+
+    The batch's ``ring.json.temp`` is scratch -- nothing reads it for recovery,
+    and the rename that installs it is the commit -- so it does not have to be
+    complete before the file moves start, only before the rename.  Starting it
+    on a background thread pays the serialize, write and fsync while the network
+    is busy, which leaves only the rename on the critical path afterwards.
+
+    Joined on the way out, so a failure inside the block cannot leave a write
+    running past it.  The block's own exception wins; a write failure is raised
+    (and never installed) only when the block succeeded.
+    """
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            ring.save(path, atomic=False)
+        except BaseException as exc:  # surfaced in the caller, not the thread
+            failures.append(exc)
+
+    worker = threading.Thread(
+        target=write, name="swift-light-ring-save", daemon=True
+    )
+    worker.start()
+    try:
+        yield
+    finally:
+        worker.join()
+    if failures:
+        raise failures[0]
 
 
 def _require_positive(name: str, value: Any) -> None:

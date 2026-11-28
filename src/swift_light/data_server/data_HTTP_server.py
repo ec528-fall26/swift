@@ -551,10 +551,11 @@ class DataHTTPServer:
         Directory the files are stored under.  Leave it out for the default
         store beside the storage module; tests pass a temporary directory.
     atomic:
-        How the store writes and deletes files.  ``True`` (the default) keeps the
+        How the store writes files.  ``True`` (the default) keeps the
         temp-file-and-rename step, so a crash never leaves a half-written file;
         ``False`` writes straight to the destination and flushes, which is what
-        ``deploy.py up non_atomic`` selects.
+        ``deploy.py up non_atomic`` selects.  Deletes are a plain unlink either
+        way.
     host / port:
         Bind address and port.  Leave them out to use the ones ``own_address``
         names; tests pass ``port=0`` for an OS-picked free port and read the

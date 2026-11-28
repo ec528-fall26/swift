@@ -50,7 +50,9 @@ temporary file in the destination directory, flushing and synchronizing its cont
 then atomically replacing the destination. Readers see the previous complete file or
 the new complete file instead of a partially written replacement. The system also
 attempts to synchronize the containing directory. This applies to each local file;
-it does not make an update atomic across all replicas.
+it does not make an update atomic across all replicas. Deletes are a plain unlink in
+both write modes: there is no half-written content to prevent, so a delete does not
+pay for a temporary file and a rename.
 
 ## 2. Design decisions
 
@@ -134,9 +136,8 @@ python3 src/swift_light/deploy.py down
 
 ## 4. Running the experiments
 
-Experiments 1 and 2 need the cluster running. Experiment 0 deploys and stops its own
-cluster in the mode it measures, and experiments 3, 4 and 5 run the test suites on
-temporary state. Once the setup process is completed, all of them can be run in a
+Experiments 0, 1, 2 and 6 need a deployed cluster. Experiments 3, 4 and 5 run the
+test suites on temporary state. Once the setup process is completed, all of them can be run in a
 separate terminal.
 
 Experiments 1 and 2 also expect the team's files `SwiftLightFiles/Hello.txt`.
@@ -421,6 +422,54 @@ That overhead is why `exp0`'s per-case numbers are much higher.
 `performance_eval/test_backend_latency.py` :: `BackendLatencyTests.test_a_timed_write_reaches_every_replica`
 asserts that every server's store is atomic, so it would fail if the run were forced non-atomic.
 
+### Experiment 6: a membership change that moves real objects
+
+| | |
+| --- | --- |
+| Supports | A rebalance's cost is the object copies, not the ring writes; the `ring saves` line isolates what the write mode costs inside a case. |
+| Command | `python3 experiments/swift_light/exp6_migration_overhead.py --mode atomic` |
+| Expected runtime | About 10 minutes per mode at the defaults (30 changes, 100 objects seeded). |
+| Expected output | A two-row table (cases, failed, seconds, ms/case, std dev, p50/p95/p99, cases/s), a `data movement` line, a `ring saves` line (total, ms per change, ms per ring write), and `every case succeeded`. |
+| Requires | The cluster up, deployed in the mode `--mode` names. No client traffic while it runs. |
+
+#### How to run the experiment
+
+```bash
+cd <cloned swift repo directory>
+
+# atomic:
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp6_migration_overhead.py --mode atomic
+echo "exit=$?"
+
+# non-atomic:
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp6_migration_overhead.py --mode non_atomic
+echo "exit=$?"
+```
+
+#### In the team's LightSail instance
+
+```bash
+cd /home/ubuntu/swift
+
+# atomic:
+python3 src/swift_light/deploy.py up
+python3 experiments/swift_light/exp6_migration_overhead.py --mode atomic
+echo "exit=$?"
+
+# non-atomic:
+python3 src/swift_light/deploy.py up non_atomic
+python3 experiments/swift_light/exp6_migration_overhead.py --mode non_atomic
+echo "exit=$?"
+```
+
+#### Note
+
+Placement comes from the hash, so how many objects a membership change moves varies
+from run to run. Total run time therefore is not comparable and does not mean much;
+the `ring saves` line is the result to read.
+
 ## 5. Claims and limitations
 
 ### Claims
@@ -441,13 +490,17 @@ automated coverage of the behaviours the tests encode:
 - **Atomic mode costs a little more per write:** Experiment 0 runs 10,000 cases
   (file writes, deletes, node joins and node leaves) against a deployed cluster in
   each mode and reports per-case milliseconds, p50/p95/p99 and cases per second.
-  Atomic mode costs more in each category, but by a margin small next to the cost
-  of the request itself: the extra work is the temporary-file write, flush, fsync
-  and atomic replace, which happen once per save, while the case still pays for
-  lookup, quorum writes and HTTP. What that buys is a ring that never lands
+  Atomic mode costs more per write and per membership change, but by a margin small
+  next to the cost of the request itself: the extra work is the temporary-file write,
+  flush, fsync and atomic replace, which happen once per save, while the case still
+  pays for lookup, quorum writes and HTTP. Deletes are a plain unlink in both modes,
+  so that row is the same either way. What that buys is a ring that never lands
   half-written. The two runs are compared from their JSON reports side by side; a
   gap smaller than the reported sample standard deviation is jitter, not a result.
-  This measures cost, not crash survival.
+  This measures cost, not crash survival. Experiment 6 repeats the membership-change
+  cases with the object copies real, and there the mode's ring write sits inside the
+  run-to-run noise: a batch writes its scratch ring while the copies run, so only the
+  rename is left once they finish.
 - **One write and one read stay inside the latency baseline:** Experiment 5 times
   100 writes and 100 reads one at a time against a real ring and real file stores
   and reports p95 10.93 ms for writes and 2.83 ms for reads, against the 50 ms and

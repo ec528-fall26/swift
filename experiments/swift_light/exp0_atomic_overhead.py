@@ -90,7 +90,10 @@ Two further averages isolate the write itself, with no network in the loop.
 The **ring save** is one rebalance batch's ring write -- the fixed
 ``ring.json.temp`` flushed and then renamed over the live ring in atomic mode,
 or the live ring flushed in place in non-atomic mode; the **file write** is one
-``DataStore.write``, the call a data server's ``PUT /files`` makes.  Both are
+``DataStore.write``, the call a data server's ``PUT /files`` makes.  A real
+batch flushes its ``ring.json.temp`` on a background thread while it moves the
+files, so after the migration only the rename is left; the sample is that whole
+write, an upper bound on what a batch still pays.  Both are
 run directly on this machine's filesystem, so a sample is only the filesystem
 work the workload itself does -- no lookup, HTTP or TCP setup is counted.
 Only the mode the run was given is measured, so the report stays one mode; run
